@@ -1,0 +1,876 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Finance Control</title>
+<meta name="robots" content="noindex, nofollow" />
+<style>
+  html, body, #root { margin: 0; padding: 0; height: 100%; background: #14171C; }
+  * { box-sizing: border-box; }
+  input[type=range] { accent-color: #4A90A4; }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-thumb { background: #2A2E36; border-radius: 4px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo, useCallback, useRef } = React;
+
+/* ============================================================
+   FINANCE CONTROL — household budgeting, scenario & forecast tool
+   Backed by Supabase (auth + Postgres w/ RLS), deployed as a
+   static site. No build step: Babel standalone compiles this
+   in-browser.
+   ============================================================ */
+
+// ---- Supabase project config (publishable key only — safe to expose;
+// access control is enforced by RLS + household allowlist, not key secrecy) ----
+const SUPABASE_URL = 'https://gqfsuhjvcawceuhblndw.supabase.co';
+const SUPABASE_ANON_KEY = 'sb_publishable_TDSpDfk0ss_vmuVU2fhh0w_PtVwu998';
+
+const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+const COLORS = {
+  bg: '#14171C', panel: '#1B1F26', panelAlt: '#20242C', line: '#2A2E36', lineFaint: '#22262D',
+  text: '#E8E6E0', textDim: '#8B909B', textFaint: '#5B606B',
+  teal: '#4A90A4', tealDim: '#3A6E7D', amber: '#C98A3E', amberDim: '#8F6329',
+  green: '#6B9E7C', greenDim: '#4C7259', red: '#B5544A',
+};
+
+const CATEGORY_DEFS = [
+  { id: 'housing', label: 'Housing', essential: true },
+  { id: 'school', label: 'School & childcare', essential: true },
+  { id: 'groceries', label: 'Groceries', essential: true },
+  { id: 'utilities', label: 'Utilities', essential: true },
+  { id: 'transport', label: 'Transport', essential: true },
+  { id: 'insurance', label: 'Insurance', essential: true },
+  { id: 'health', label: 'Health & medical', essential: true },
+  { id: 'debt', label: 'Debt repayment', essential: true },
+  { id: 'dining', label: 'Dining & takeaway', essential: false },
+  { id: 'subscriptions', label: 'Subscriptions & media', essential: false },
+  { id: 'shopping', label: 'Shopping & retail', essential: false },
+  { id: 'travel', label: 'Travel & holidays', essential: false },
+  { id: 'fitness', label: 'Fitness & wellness', essential: false },
+  { id: 'entertainment', label: 'Entertainment', essential: false },
+  { id: 'gifts', label: 'Gifts & donations', essential: false },
+  { id: 'savings', label: 'Savings & investing', essential: true },
+  { id: 'other', label: 'Other', essential: false },
+];
+
+const ASSET_CLASSES = [
+  { id: 'cash', label: 'Cash & offset', defaultReturn: 3.5 },
+  { id: 'bonds', label: 'Bonds / fixed income', defaultReturn: 4.5 },
+  { id: 'ausEquity', label: 'Australian equities', defaultReturn: 8.0 },
+  { id: 'intlEquity', label: 'International equities', defaultReturn: 8.5 },
+  { id: 'property', label: 'Property', defaultReturn: 6.0 },
+  { id: 'super', label: 'Superannuation', defaultReturn: 7.5 },
+];
+
+const nowMonthKey = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`; };
+const fmt = (n, opts = {}) => {
+  if (n === null || n === undefined || isNaN(n)) return '—';
+  const abs = Math.abs(n); const sign = n < 0 ? '-' : '';
+  if (opts.compact && abs >= 1000) { if (abs >= 1000000) return `${sign}$${(abs / 1000000).toFixed(2)}M`; return `${sign}$${(abs / 1000).toFixed(0)}k`; }
+  return `${sign}$${abs.toLocaleString('en-AU', { maximumFractionDigits: 0 })}`;
+};
+const monthLabel = (key) => { const [y, m] = key.split('-').map(Number); return new Date(y, m - 1, 1).toLocaleDateString('en-AU', { month: 'short', year: '2-digit' }); };
+const addMonths = (key, n) => { const [y, m] = key.split('-').map(Number); const d = new Date(y, m - 1 + n, 1); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`; };
+const uid = () => (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2, 10));
+
+/* ================= SUPABASE DATA LAYER ================= */
+
+async function fetchAllFinanceData() {
+  const [income, months, scenarios, events, portSettings, portAlloc] = await Promise.all([
+    supabase.from('budget_income_sources').select('*').order('created_at'),
+    supabase.from('budget_months').select('*'),
+    supabase.from('scenarios').select('*').order('updated_at'),
+    supabase.from('scenario_events').select('*'),
+    supabase.from('portfolio_settings').select('*').eq('id', 1).maybeSingle(),
+    supabase.from('portfolio_allocations').select('*'),
+  ]);
+  const errs = [income.error, months.error, scenarios.error, events.error, portSettings.error, portAlloc.error].filter(Boolean);
+  if (errs.length) throw errs[0];
+
+  const budget = {
+    incomeSources: (income.data || []).map((r) => ({ id: r.source_key, dbId: r.id, label: r.label })),
+    months: {},
+  };
+  (months.data || []).forEach((r) => { budget.months[r.month_key] = { income: r.income || {}, spend: r.spend || {} }; });
+
+  const scenarioList = (scenarios.data || []).map((s) => ({
+    id: s.id, name: s.name, startNetWorth: Number(s.start_net_worth), startCash: Number(s.start_cash),
+    baseMonthlyIncome: Number(s.base_monthly_income), baseMonthlyExpense: Number(s.base_monthly_expense),
+    horizonYears: s.horizon_years,
+    events: (events.data || []).filter((e) => e.scenario_id === s.id).map((e) => ({
+      id: e.id, label: e.label, type: e.event_type, amount: Number(e.amount), startMonth: e.start_month, endMonth: e.end_month,
+    })),
+  }));
+
+  const allocations = {};
+  (portAlloc.data || []).forEach((r) => { allocations[r.asset_class_id] = { value: Number(r.value), expReturn: Number(r.expected_return) }; });
+
+  const portfolio = {
+    monthlyContribution: portSettings.data ? Number(portSettings.data.monthly_contribution) : 0,
+    targetYears: portSettings.data ? portSettings.data.target_years : 25,
+    inflation: portSettings.data ? Number(portSettings.data.inflation) : 2.5,
+    retirementDrawdown: portSettings.data ? Number(portSettings.data.retirement_drawdown) : 60000,
+    allocations,
+  };
+
+  return { budget, scenarioList, portfolio };
+}
+
+async function saveIncomeSource(src) {
+  await supabase.from('budget_income_sources').upsert({ source_key: src.id, label: src.label }, { onConflict: 'source_key' });
+}
+async function deleteIncomeSource(sourceKey) {
+  await supabase.from('budget_income_sources').delete().eq('source_key', sourceKey);
+}
+async function saveMonth(monthKey, income, spend, userId) {
+  await supabase.from('budget_months').upsert({ month_key: monthKey, income, spend, updated_by: userId, updated_at: new Date().toISOString() }, { onConflict: 'month_key' });
+}
+async function saveScenario(s, userId) {
+  const { data, error } = await supabase.from('scenarios').upsert({
+    id: s.id, name: s.name, start_net_worth: s.startNetWorth, start_cash: s.startCash,
+    base_monthly_income: s.baseMonthlyIncome, base_monthly_expense: s.baseMonthlyExpense,
+    horizon_years: s.horizonYears || 10, updated_by: userId, updated_at: new Date().toISOString(),
+  }).select().single();
+  if (error) throw error;
+  return data.id;
+}
+async function deleteScenario(id) { await supabase.from('scenarios').delete().eq('id', id); }
+async function saveScenarioEvent(scenarioId, ev) {
+  await supabase.from('scenario_events').upsert({
+    id: ev.id, scenario_id: scenarioId, label: ev.label, event_type: ev.type,
+    amount: ev.amount, start_month: ev.startMonth, end_month: ev.endMonth,
+  });
+}
+async function deleteScenarioEvent(id) { await supabase.from('scenario_events').delete().eq('id', id); }
+async function savePortfolioSettings(p, userId) {
+  await supabase.from('portfolio_settings').upsert({
+    id: 1, monthly_contribution: p.monthlyContribution, target_years: p.targetYears,
+    inflation: p.inflation, retirement_drawdown: p.retirementDrawdown,
+    updated_by: userId, updated_at: new Date().toISOString(),
+  });
+}
+async function savePortfolioAllocation(assetClassId, value, expReturn, userId) {
+  await supabase.from('portfolio_allocations').upsert({
+    asset_class_id: assetClassId, value, expected_return: expReturn, updated_by: userId, updated_at: new Date().toISOString(),
+  });
+}
+
+/* ---------------- primitives ---------------- */
+
+function Panel({ title, sub, right, children, style }) {
+  return (
+    <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 6, ...style }}>
+      {(title || right) && (
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', padding: '14px 18px', borderBottom: `1px solid ${COLORS.line}` }}>
+          <div>
+            {title && <div style={{ fontSize: 13, fontWeight: 600, letterSpacing: '0.02em', color: COLORS.text }}>{title}</div>}
+            {sub && <div style={{ fontSize: 11.5, color: COLORS.textDim, marginTop: 2 }}>{sub}</div>}
+          </div>
+          {right}
+        </div>
+      )}
+      <div style={{ padding: 18 }}>{children}</div>
+    </div>
+  );
+}
+
+function NumInput({ value, onChange, prefix = '$', small, placeholder }) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', background: COLORS.panelAlt, border: `1px solid ${COLORS.line}`, borderRadius: 4, padding: small ? '4px 8px' : '6px 10px' }}>
+      {prefix && <span style={{ color: COLORS.textFaint, fontSize: small ? 12 : 13, marginRight: 4, fontFamily: 'ui-monospace, monospace' }}>{prefix}</span>}
+      <input type="number" value={value === 0 ? 0 : (value || '')} placeholder={placeholder}
+        onChange={(e) => onChange(e.target.value === '' ? 0 : parseFloat(e.target.value))}
+        style={{ background: 'transparent', border: 'none', outline: 'none', color: COLORS.text, fontFamily: 'ui-monospace, "SF Mono", monospace', fontSize: small ? 12 : 13.5, width: '100%', fontVariantNumeric: 'tabular-nums' }} />
+    </div>
+  );
+}
+function TextInput({ value, onChange, placeholder, style }) {
+  return <input type="text" value={value || ''} placeholder={placeholder} onChange={(e) => onChange(e.target.value)}
+    style={{ background: COLORS.panelAlt, border: `1px solid ${COLORS.line}`, borderRadius: 4, padding: '6px 10px', color: COLORS.text, fontSize: 13, outline: 'none', ...style }} />;
+}
+function Select({ value, onChange, options, style }) {
+  return (
+    <select value={value} onChange={(e) => onChange(e.target.value)}
+      style={{ background: COLORS.panelAlt, border: `1px solid ${COLORS.line}`, borderRadius: 4, padding: '6px 10px', color: COLORS.text, fontSize: 13, outline: 'none', ...style }}>
+      {options.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+    </select>
+  );
+}
+function Button({ children, onClick, variant = 'default', small }) {
+  const styles = {
+    default: { background: COLORS.panelAlt, color: COLORS.text, border: `1px solid ${COLORS.line}` },
+    primary: { background: COLORS.teal, color: '#0D1013', border: `1px solid ${COLORS.teal}` },
+    danger: { background: 'transparent', color: COLORS.red, border: `1px solid ${COLORS.red}44` },
+    ghost: { background: 'transparent', color: COLORS.textDim, border: `1px solid transparent` },
+  };
+  return <button onClick={onClick} style={{ ...styles[variant], borderRadius: 4, padding: small ? '5px 10px' : '7px 14px', fontSize: small ? 12 : 13, fontWeight: 500, cursor: 'pointer', whiteSpace: 'nowrap' }}>{children}</button>;
+}
+function Stat({ label, value, accent }) {
+  return (
+    <div>
+      <div style={{ fontSize: 11, color: COLORS.textDim, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 4 }}>{label}</div>
+      <div style={{ fontSize: 22, fontFamily: 'ui-monospace, monospace', fontWeight: 600, color: accent || COLORS.text, fontVariantNumeric: 'tabular-nums' }}>{value}</div>
+    </div>
+  );
+}
+
+function RunwayStrip({ netCash, monthlySurplus, runwayMonths }) {
+  const positive = netCash >= 0;
+  const pct = Math.max(0, Math.min(100, (runwayMonths / 12) * 100));
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 18, padding: '10px 20px', background: COLORS.panelAlt, borderBottom: `1px solid ${COLORS.line}`, flexWrap: 'wrap' }}>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
+        <span style={{ fontSize: 10, color: COLORS.textFaint, textTransform: 'uppercase', letterSpacing: '0.06em' }}>Net position</span>
+        <span style={{ fontFamily: 'ui-monospace, monospace', fontSize: 15, fontWeight: 600, color: positive ? COLORS.green : COLORS.red, fontVariantNumeric: 'tabular-nums' }}>{fmt(netCash, { compact: true })}</span>
+      </div>
+      <div style={{ width: 1, height: 16, background: COLORS.line }} />
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
+        <span style={{ fontSize: 10, color: COLORS.textFaint, textTransform: 'uppercase', letterSpacing: '0.06em' }}>Monthly surplus</span>
+        <span style={{ fontFamily: 'ui-monospace, monospace', fontSize: 15, fontWeight: 600, color: monthlySurplus >= 0 ? COLORS.text : COLORS.amber, fontVariantNumeric: 'tabular-nums' }}>{fmt(monthlySurplus, { compact: true })}</span>
+      </div>
+      <div style={{ width: 1, height: 16, background: COLORS.line }} />
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flex: 1, minWidth: 160 }}>
+        <span style={{ fontSize: 10, color: COLORS.textFaint, textTransform: 'uppercase', letterSpacing: '0.06em', whiteSpace: 'nowrap' }}>Runway {runwayMonths >= 999 ? '12+' : runwayMonths.toFixed(1)}mo</span>
+        <div style={{ flex: 1, height: 4, background: COLORS.line, borderRadius: 2, overflow: 'hidden', maxWidth: 140 }}>
+          <div style={{ width: `${pct}%`, height: '100%', background: pct > 50 ? COLORS.green : pct > 20 ? COLORS.amber : COLORS.red }} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ================= BUDGET MODULE ================= */
+
+function BudgetModule({ budget, onUpdateMonth, onAddIncomeSource, onRenameIncomeSource, onRemoveIncomeSource }) {
+  const [month, setMonth] = useState(nowMonthKey());
+  const monthData = budget.months?.[month] || { income: {}, spend: {} };
+  const incomeSources = budget.incomeSources || [];
+  const totalIncome = incomeSources.reduce((s, src) => s + (monthData.income[src.id] || 0), 0);
+  const totalSpend = CATEGORY_DEFS.reduce((s, c) => s + (monthData.spend[c.id] || 0), 0);
+  const surplus = totalIncome - totalSpend;
+
+  const setIncome = (srcId, val) => onUpdateMonth(month, { ...monthData.income, [srcId]: val }, monthData.spend);
+  const setSpend = (catId, val) => onUpdateMonth(month, monthData.income, { ...monthData.spend, [catId]: val });
+
+  const trendMonths = useMemo(() => { const arr = []; for (let i = 5; i >= 0; i--) arr.push(addMonths(month, -i)); return arr; }, [month]);
+  const essentialSpend = CATEGORY_DEFS.filter((c) => c.essential).reduce((s, c) => s + (monthData.spend[c.id] || 0), 0);
+  const nonEssentialSpend = totalSpend - essentialSpend;
+  const sortedCats = [...CATEGORY_DEFS].sort((a, b) => (monthData.spend[b.id] || 0) - (monthData.spend[a.id] || 0));
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+          <Button small onClick={() => setMonth(addMonths(month, -1))}>←</Button>
+          <div style={{ fontFamily: 'ui-monospace, monospace', fontSize: 14, color: COLORS.text, minWidth: 80, textAlign: 'center' }}>{monthLabel(month)}</div>
+          <Button small onClick={() => setMonth(addMonths(month, 1))}>→</Button>
+          {month !== nowMonthKey() && <Button small variant="ghost" onClick={() => setMonth(nowMonthKey())}>Today</Button>}
+        </div>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12 }}>
+        <Panel><Stat label="Income" value={fmt(totalIncome, { compact: true })} /></Panel>
+        <Panel><Stat label="Spend" value={fmt(totalSpend, { compact: true })} /></Panel>
+        <Panel><Stat label="Surplus" value={fmt(surplus, { compact: true })} accent={surplus >= 0 ? COLORS.green : COLORS.red} /></Panel>
+        <Panel><Stat label="Essential vs discretionary" value={`${totalSpend ? Math.round((essentialSpend / totalSpend) * 100) : 0}% / ${totalSpend ? Math.round((nonEssentialSpend / totalSpend) * 100) : 0}%`} /></Panel>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+        <Panel title="Income" sub="By source, this month" right={<Button small variant="ghost" onClick={onAddIncomeSource}>+ Source</Button>}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {incomeSources.map((src) => (
+              <div key={src.id} style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                <TextInput value={src.label} onChange={(v) => onRenameIncomeSource(src.id, v)} style={{ flex: 1 }} />
+                <div style={{ width: 130 }}><NumInput value={monthData.income[src.id] || 0} onChange={(v) => setIncome(src.id, v)} /></div>
+                {incomeSources.length > 1 && <Button small variant="ghost" onClick={() => onRemoveIncomeSource(src.id)}>✕</Button>}
+              </div>
+            ))}
+          </div>
+        </Panel>
+
+        <Panel title="Spending by category" sub="This month — highest first">
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 7, maxHeight: 320, overflowY: 'auto' }}>
+            {sortedCats.map((c) => {
+              const val = monthData.spend[c.id] || 0;
+              const pct = totalSpend ? (val / totalSpend) * 100 : 0;
+              return (
+                <div key={c.id} style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                  <div style={{ width: 130, fontSize: 12.5, color: c.essential ? COLORS.textDim : COLORS.text, display: 'flex', alignItems: 'center', gap: 5 }}>
+                    {!c.essential && <span style={{ width: 5, height: 5, borderRadius: 3, background: COLORS.amber, display: 'inline-block' }} />}{c.label}
+                  </div>
+                  <div style={{ flex: 1, height: 14, background: COLORS.panelAlt, borderRadius: 2, overflow: 'hidden' }}>
+                    <div style={{ width: `${Math.min(100, pct)}%`, height: '100%', background: c.essential ? COLORS.tealDim : COLORS.amberDim }} />
+                  </div>
+                  <div style={{ width: 90 }}><NumInput small value={val} onChange={(v) => setSpend(c.id, v)} /></div>
+                </div>
+              );
+            })}
+          </div>
+        </Panel>
+      </div>
+
+      <Panel title="6-month trend" sub="Income vs spend">
+        <div style={{ display: 'flex', alignItems: 'flex-end', gap: 10, height: 140, padding: '0 4px' }}>
+          {trendMonths.map((mk) => {
+            const md = budget.months?.[mk] || { income: {}, spend: {} };
+            const inc = incomeSources.reduce((s, src) => s + (md.income[src.id] || 0), 0);
+            const sp = CATEGORY_DEFS.reduce((s, c) => s + (md.spend[c.id] || 0), 0);
+            const max = Math.max(1, ...trendMonths.map((k) => {
+              const d = budget.months?.[k] || { income: {}, spend: {} };
+              return Math.max(incomeSources.reduce((s, src) => s + (d.income[src.id] || 0), 0), CATEGORY_DEFS.reduce((s, c) => s + (d.spend[c.id] || 0), 0));
+            }));
+            return (
+              <div key={mk} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
+                <div style={{ display: 'flex', gap: 3, alignItems: 'flex-end', height: 100 }}>
+                  <div style={{ width: 14, height: `${(inc / max) * 100}%`, background: COLORS.teal, borderRadius: '2px 2px 0 0', minHeight: 2 }} title={fmt(inc)} />
+                  <div style={{ width: 14, height: `${(sp / max) * 100}%`, background: sp > inc ? COLORS.red : COLORS.amberDim, borderRadius: '2px 2px 0 0', minHeight: 2 }} title={fmt(sp)} />
+                </div>
+                <div style={{ fontSize: 10, color: COLORS.textFaint }}>{monthLabel(mk)}</div>
+              </div>
+            );
+          })}
+        </div>
+        <div style={{ display: 'flex', gap: 16, marginTop: 10, fontSize: 11, color: COLORS.textDim }}>
+          <span><span style={{ display: 'inline-block', width: 8, height: 8, background: COLORS.teal, borderRadius: 2, marginRight: 5 }} />Income</span>
+          <span><span style={{ display: 'inline-block', width: 8, height: 8, background: COLORS.amberDim, borderRadius: 2, marginRight: 5 }} />Spend</span>
+        </div>
+      </Panel>
+    </div>
+  );
+}
+
+/* ================= COST CUTTING MODULE ================= */
+
+const BENCHMARKS = { housing: 30, school: 12, groceries: 12, utilities: 4, transport: 8, insurance: 4, health: 3, debt: 10, dining: 5, subscriptions: 2, shopping: 5, travel: 5, fitness: 2, entertainment: 3, gifts: 2, savings: 15, other: 3 };
+const SUGGESTIONS = {
+  dining: 'Cap takeaway/dining to a fixed weekly allowance; batch-cook two nights a week.',
+  subscriptions: 'Audit every recurring subscription this week — cancel anything unused in 60 days.',
+  shopping: 'Add a 48-hour rule for non-essential purchases over $100.',
+  utilities: 'Compare energy retailers annually; many households overpay by 15-20% by not switching.',
+  insurance: 'Bundle or re-quote home/contents/car insurance annually — loyalty tax is real.',
+  transport: 'Model cost of one car vs two if commute patterns allow; parking/tolls often hidden.',
+  entertainment: 'Rotate streaming subscriptions rather than running all concurrently.',
+  travel: 'Set a fixed annual travel budget and save toward it monthly rather than ad hoc.',
+  groceries: 'Meal-plan weekly and shop with a list — impulse grocery spend is typically 15-20% of the bill.',
+  housing: 'If well above benchmark, this is the single largest lever — refinancing or downsizing has outsized impact.',
+  fitness: 'Check for corporate/health-fund gym discounts or consolidate multiple memberships.',
+  gifts: 'Set an annual gifts budget in December rather than spending reactively year-round.',
+  other: 'Categorise "other" spend properly — it usually hides 2-3 real categories worth tracking.',
+};
+
+function CostCuttingModule({ budget }) {
+  const month = nowMonthKey();
+  const monthData = budget.months?.[month] || { income: {}, spend: {} };
+  const incomeSources = budget.incomeSources || [];
+  const totalIncome = incomeSources.reduce((s, src) => s + (monthData.income[src.id] || 0), 0);
+  const rows = CATEGORY_DEFS.map((c) => {
+    const val = monthData.spend[c.id] || 0;
+    const actualPct = totalIncome ? (val / totalIncome) * 100 : 0;
+    const benchPct = BENCHMARKS[c.id];
+    return { ...c, val, actualPct, benchPct, over: actualPct - benchPct };
+  }).filter((r) => r.val > 0).sort((a, b) => b.over - a.over);
+  const overBudget = rows.filter((r) => r.over > 1);
+  const potentialSaving = overBudget.reduce((s, r) => s + (r.over / 100) * totalIncome, 0);
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+      {!totalIncome ? (
+        <Panel><div style={{ color: COLORS.textDim, fontSize: 13 }}>Enter income and spending in the Budget tab first — this view benchmarks your categories against typical household proportions.</div></Panel>
+      ) : (
+        <>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12 }}>
+            <Panel><Stat label="Categories over benchmark" value={overBudget.length} accent={overBudget.length ? COLORS.amber : COLORS.green} /></Panel>
+            <Panel><Stat label="Est. monthly saving potential" value={fmt(potentialSaving, { compact: true })} accent={COLORS.green} /></Panel>
+            <Panel><Stat label="Est. annual saving potential" value={fmt(potentialSaving * 12, { compact: true })} accent={COLORS.green} /></Panel>
+          </div>
+          <Panel title="Spend vs benchmark" sub="Benchmark = typical share of income for an Australian household">
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+              {rows.map((r) => (
+                <div key={r.id}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12.5, marginBottom: 4 }}>
+                    <span style={{ color: COLORS.text }}>{r.label}</span>
+                    <span style={{ fontFamily: 'ui-monospace, monospace', color: r.over > 1 ? COLORS.amber : COLORS.textDim }}>{r.actualPct.toFixed(1)}% <span style={{ color: COLORS.textFaint }}>vs {r.benchPct}% typical</span></span>
+                  </div>
+                  <div style={{ position: 'relative', height: 8, background: COLORS.panelAlt, borderRadius: 2, overflow: 'hidden' }}>
+                    <div style={{ position: 'absolute', left: `${Math.min(100, r.benchPct * 2)}%`, top: 0, bottom: 0, width: 1, background: COLORS.textFaint, zIndex: 2 }} />
+                    <div style={{ width: `${Math.min(100, r.actualPct * 2)}%`, height: '100%', background: r.over > 1 ? COLORS.amber : COLORS.tealDim }} />
+                  </div>
+                </div>
+              ))}
+            </div>
+          </Panel>
+          <Panel title="Suggested levers" sub="Concrete actions for categories running hot">
+            {overBudget.length === 0 ? <div style={{ color: COLORS.green, fontSize: 13 }}>Nothing running significantly over benchmark this month.</div> : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                {overBudget.map((r) => (
+                  <div key={r.id} style={{ display: 'flex', gap: 12, alignItems: 'flex-start' }}>
+                    <div style={{ minWidth: 130, fontSize: 12.5, fontWeight: 600, color: COLORS.text }}>{r.label}</div>
+                    <div style={{ fontSize: 12.5, color: COLORS.textDim, lineHeight: 1.5 }}>
+                      {SUGGESTIONS[r.id] || 'Review this category for recurring or avoidable spend.'}
+                      <span style={{ color: COLORS.amber }}> Trimming to benchmark saves ~{fmt((r.over / 100) * totalIncome, { compact: true })}/mo.</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </Panel>
+        </>
+      )}
+    </div>
+  );
+}
+
+/* ================= SCENARIOS MODULE ================= */
+
+const EVENT_TYPES = [
+  { id: 'income_change', label: 'Income change (recurring)' },
+  { id: 'expense_change', label: 'Expense change (recurring)' },
+  { id: 'one_off', label: 'One-off cash flow' },
+  { id: 'asset_sale', label: 'Sell an asset' },
+  { id: 'asset_purchase', label: 'Buy an asset' },
+  { id: 'debt_change', label: 'Debt drawn / repaid' },
+];
+
+function defaultScenario(name) {
+  return { id: uid(), name, startNetWorth: 0, startCash: 0, baseMonthlyIncome: 0, baseMonthlyExpense: 0, horizonYears: 10, events: [] };
+}
+
+function projectScenario(scenario, months) {
+  const points = [];
+  let netWorth = scenario.startNetWorth || 0;
+  let cash = scenario.startCash || 0;
+  const startKey = nowMonthKey();
+  for (let i = 0; i < months; i++) {
+    const mk = addMonths(startKey, i);
+    let income = scenario.baseMonthlyIncome || 0;
+    let expense = scenario.baseMonthlyExpense || 0;
+    let oneOffDelta = 0;
+    (scenario.events || []).forEach((ev) => {
+      const active = ev.startMonth <= i && (ev.endMonth === null || ev.endMonth === undefined || i <= ev.endMonth);
+      if (ev.type === 'income_change' && active) income += Number(ev.amount) || 0;
+      if (ev.type === 'expense_change' && active) expense += Number(ev.amount) || 0;
+      if (ev.type === 'one_off' && ev.startMonth === i) oneOffDelta += Number(ev.amount) || 0;
+      if (ev.type === 'asset_sale' && ev.startMonth === i) oneOffDelta += Number(ev.amount) || 0;
+      if (ev.type === 'asset_purchase' && ev.startMonth === i) oneOffDelta -= Number(ev.amount) || 0;
+      if (ev.type === 'debt_change' && ev.startMonth === i) oneOffDelta += Number(ev.amount) || 0;
+    });
+    const surplus = income - expense + oneOffDelta;
+    cash += surplus; netWorth += surplus;
+    points.push({ month: i, monthKey: mk, netWorth, cash, income, expense, surplus });
+  }
+  return points;
+}
+
+function EventEditor({ event, onChange, onRemove, horizonMonths }) {
+  const isRecurring = event.type === 'income_change' || event.type === 'expense_change';
+  return (
+    <div style={{ display: 'grid', gridTemplateColumns: '1.3fr 1fr 1fr 0.9fr 0.9fr auto', gap: 8, alignItems: 'center', padding: '8px 0', borderBottom: `1px solid ${COLORS.lineFaint}` }}>
+      <TextInput value={event.label} onChange={(v) => onChange({ ...event, label: v })} placeholder="Event label" />
+      <Select value={event.type} onChange={(v) => onChange({ ...event, type: v })} options={EVENT_TYPES.map((t) => ({ value: t.id, label: t.label }))} />
+      <NumInput value={event.amount} onChange={(v) => onChange({ ...event, amount: v })} prefix={event.type === 'expense_change' ? '−$' : '$'} small />
+      <div>
+        <div style={{ fontSize: 10, color: COLORS.textFaint, marginBottom: 2 }}>From month</div>
+        <input type="range" min={0} max={horizonMonths - 1} value={event.startMonth} onChange={(e) => onChange({ ...event, startMonth: parseInt(e.target.value) })} style={{ width: '100%' }} />
+        <div style={{ fontSize: 10.5, color: COLORS.textDim, fontFamily: 'ui-monospace, monospace' }}>{monthLabel(addMonths(nowMonthKey(), event.startMonth))}</div>
+      </div>
+      {isRecurring ? (
+        <div>
+          <div style={{ fontSize: 10, color: COLORS.textFaint, marginBottom: 2 }}>Until</div>
+          <Select value={event.endMonth === null || event.endMonth === undefined ? 'end' : 'set'}
+            onChange={(v) => onChange({ ...event, endMonth: v === 'end' ? null : Math.min(horizonMonths - 1, event.startMonth + 12) })}
+            options={[{ value: 'end', label: 'Ongoing' }, { value: 'set', label: 'Set end' }]} style={{ width: '100%', fontSize: 11.5 }} />
+          {event.endMonth !== null && event.endMonth !== undefined && (
+            <input type="range" min={event.startMonth} max={horizonMonths - 1} value={event.endMonth} onChange={(e) => onChange({ ...event, endMonth: parseInt(e.target.value) })} style={{ width: '100%', marginTop: 4 }} />
+          )}
+        </div>
+      ) : <div style={{ fontSize: 11, color: COLORS.textFaint }}>one-off</div>}
+      <Button small variant="ghost" onClick={onRemove}>✕</Button>
+    </div>
+  );
+}
+
+function ScenarioEditor({ scenario, onChange, horizonMonths, onAddEvent, onUpdateEvent, onRemoveEvent }) {
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 10 }}>
+        <div><div style={{ fontSize: 10.5, color: COLORS.textFaint, marginBottom: 3 }}>Starting net worth</div><NumInput value={scenario.startNetWorth} onChange={(v) => onChange({ ...scenario, startNetWorth: v })} /></div>
+        <div><div style={{ fontSize: 10.5, color: COLORS.textFaint, marginBottom: 3 }}>Starting cash</div><NumInput value={scenario.startCash} onChange={(v) => onChange({ ...scenario, startCash: v })} /></div>
+        <div><div style={{ fontSize: 10.5, color: COLORS.textFaint, marginBottom: 3 }}>Base monthly income</div><NumInput value={scenario.baseMonthlyIncome} onChange={(v) => onChange({ ...scenario, baseMonthlyIncome: v })} /></div>
+        <div><div style={{ fontSize: 10.5, color: COLORS.textFaint, marginBottom: 3 }}>Base monthly expense</div><NumInput value={scenario.baseMonthlyExpense} onChange={(v) => onChange({ ...scenario, baseMonthlyExpense: v })} /></div>
+      </div>
+      <div>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+          <div style={{ fontSize: 12, color: COLORS.textDim }}>Timeline events</div>
+          <Button small variant="ghost" onClick={onAddEvent}>+ Event</Button>
+        </div>
+        {scenario.events.length === 0 && <div style={{ fontSize: 12, color: COLORS.textFaint, padding: '8px 0' }}>No events — this scenario is just the base income/expense run forward.</div>}
+        {scenario.events.map((ev) => <EventEditor key={ev.id} event={ev} onChange={(patch) => onUpdateEvent(ev.id, patch)} onRemove={() => onRemoveEvent(ev.id)} horizonMonths={horizonMonths} />)}
+      </div>
+    </div>
+  );
+}
+
+function ScenarioChart({ series, horizonMonths, metric }) {
+  const allVals = series.flatMap((s) => s.points.map((p) => p[metric]));
+  const max = Math.max(...allVals, 0), min = Math.min(...allVals, 0), range = max - min || 1;
+  const w = 100, h = 100;
+  const pathFor = (points) => points.map((p, i) => `${i === 0 ? 'M' : 'L'}${((i / (horizonMonths - 1)) * w).toFixed(2)},${(h - ((p[metric] - min) / range) * h).toFixed(2)}`).join(' ');
+  const zeroY = h - ((0 - min) / range) * h;
+  return (
+    <div>
+      <svg viewBox={`0 0 ${w} ${h}`} style={{ width: '100%', height: 220, overflow: 'visible' }} preserveAspectRatio="none">
+        <line x1={0} y1={zeroY} x2={w} y2={zeroY} stroke={COLORS.line} strokeWidth={0.5} />
+        {series.map((s) => <path key={s.id} d={pathFor(s.points)} fill="none" stroke={s.color} strokeWidth={0.8} vectorEffect="non-scaling-stroke" />)}
+      </svg>
+      <div style={{ display: 'flex', gap: 16, marginTop: 12, flexWrap: 'wrap' }}>
+        {series.map((s) => { const last = s.points[s.points.length - 1]; return (
+          <div key={s.id} style={{ fontSize: 12 }}>
+            <span style={{ display: 'inline-block', width: 8, height: 8, background: s.color, borderRadius: 4, marginRight: 6 }} />
+            <span style={{ color: COLORS.text }}>{s.name}</span>
+            <span style={{ color: COLORS.textDim, marginLeft: 6, fontFamily: 'ui-monospace, monospace' }}>{fmt(last[metric], { compact: true })}</span>
+          </div>
+        ); })}
+      </div>
+    </div>
+  );
+}
+
+const SCENARIO_COLORS = [COLORS.teal, COLORS.amber, COLORS.green, '#9B7EDE', '#DE7EA8'];
+
+function ScenariosModule({ scenarios, onAddScenario, onUpdateScenario, onRemoveScenario, onAddEvent, onUpdateEvent, onRemoveEvent, onSetHorizon }) {
+  const [activeIds, setActiveIds] = useState(() => scenarios.slice(0, 2).map((s) => s.id));
+  const [editingId, setEditingId] = useState(scenarios[0]?.id || null);
+  const [metric, setMetric] = useState('netWorth');
+  const globalHorizon = scenarios[0]?.horizonYears || 10;
+  const horizonMonths = globalHorizon * 12;
+
+  useEffect(() => { setActiveIds((prev) => prev.filter((id) => scenarios.some((s) => s.id === id))); }, [scenarios]);
+
+  const toggleActive = (id) => setActiveIds((prev) => prev.includes(id) ? prev.filter((i) => i !== id) : [...prev, id].slice(-3));
+  const series = useMemo(() => scenarios.filter((s) => activeIds.includes(s.id)).map((s, i) => ({ id: s.id, name: s.name, color: SCENARIO_COLORS[i % SCENARIO_COLORS.length], points: projectScenario(s, horizonMonths) })), [scenarios, activeIds, horizonMonths]);
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+          <span style={{ fontSize: 12, color: COLORS.textDim }}>Horizon</span>
+          <Select value={String(globalHorizon)} onChange={(v) => onSetHorizon(parseInt(v))} options={[5, 10, 15, 20, 30].map((y) => ({ value: String(y), label: `${y} years` }))} />
+          <span style={{ fontSize: 12, color: COLORS.textDim, marginLeft: 8 }}>Chart</span>
+          <Select value={metric} onChange={setMetric} options={[{ value: 'netWorth', label: 'Net worth' }, { value: 'cash', label: 'Cash position' }]} />
+        </div>
+        <Button variant="primary" small onClick={() => { const s = defaultScenario(`Scenario ${scenarios.length + 1}`); s.horizonYears = globalHorizon; onAddScenario(s); setEditingId(s.id); setActiveIds((prev) => [...prev, s.id].slice(-3)); }}>+ New scenario</Button>
+      </div>
+
+      <Panel title="Comparison" sub={`Select up to 3 scenarios to overlay — ${globalHorizon} year projection`}>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 14 }}>
+          {scenarios.map((s) => (
+            <button key={s.id} onClick={() => toggleActive(s.id)} style={{ padding: '5px 12px', borderRadius: 4, fontSize: 12.5, cursor: 'pointer',
+              border: `1px solid ${activeIds.includes(s.id) ? SCENARIO_COLORS[activeIds.indexOf(s.id) % SCENARIO_COLORS.length] : COLORS.line}`,
+              background: activeIds.includes(s.id) ? `${SCENARIO_COLORS[activeIds.indexOf(s.id) % SCENARIO_COLORS.length]}22` : 'transparent',
+              color: activeIds.includes(s.id) ? COLORS.text : COLORS.textDim }}>{s.name}</button>
+          ))}
+        </div>
+        {series.length > 0 ? <ScenarioChart series={series} horizonMonths={horizonMonths} metric={metric} /> : <div style={{ color: COLORS.textFaint, fontSize: 13 }}>Select at least one scenario above.</div>}
+      </Panel>
+
+      <Panel title="Scenarios" sub="Edit assumptions and timeline events for each">
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+          {scenarios.map((s) => (
+            <div key={s.id}>
+              <div onClick={() => setEditingId(editingId === s.id ? null : s.id)} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', cursor: 'pointer', padding: '10px 4px', borderBottom: `1px solid ${COLORS.lineFaint}` }}>
+                <TextInput value={s.name} onChange={(v) => onUpdateScenario({ ...s, name: v })} style={{ fontWeight: 600, border: 'none', background: 'transparent', padding: 0 }} />
+                <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                  <span style={{ fontSize: 11, color: COLORS.textFaint }}>{s.events.length} event{s.events.length !== 1 ? 's' : ''}</span>
+                  <Button small variant="ghost" onClick={(e) => { e.stopPropagation(); onRemoveScenario(s.id); }}>✕</Button>
+                  <span style={{ color: COLORS.textFaint, fontSize: 11 }}>{editingId === s.id ? '▲' : '▼'}</span>
+                </div>
+              </div>
+              {editingId === s.id && (
+                <div style={{ padding: '12px 4px' }}>
+                  <ScenarioEditor scenario={s} horizonMonths={horizonMonths}
+                    onChange={onUpdateScenario}
+                    onAddEvent={() => onAddEvent(s.id, { id: uid(), label: 'New event', type: 'expense_change', amount: 0, startMonth: 0, endMonth: null })}
+                    onUpdateEvent={(id, patch) => onUpdateEvent(s.id, id, patch)}
+                    onRemoveEvent={(id) => onRemoveEvent(s.id, id)}
+                  />
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      </Panel>
+    </div>
+  );
+}
+
+/* ================= INVESTMENT MODULE ================= */
+
+function InvestmentModule({ portfolio, onUpdateSettings, onUpdateAllocation }) {
+  const allocations = portfolio.allocations || {};
+  const monthlyContribution = portfolio.monthlyContribution || 0;
+  const targetYears = portfolio.targetYears || 25;
+  const inflation = portfolio.inflation ?? 2.5;
+  const retirementDrawdown = portfolio.retirementDrawdown || 60000;
+
+  const totalValue = ASSET_CLASSES.reduce((s, c) => s + (allocations[c.id]?.value || 0), 0);
+  const blendedReturn = totalValue ? ASSET_CLASSES.reduce((s, c) => s + ((allocations[c.id]?.value || 0) * (allocations[c.id]?.expReturn ?? c.defaultReturn)), 0) / totalValue : 0;
+
+  const projection = useMemo(() => {
+    const pts = []; let val = totalValue;
+    const monthlyReturn = Math.pow(1 + blendedReturn / 100, 1 / 12) - 1;
+    for (let y = 0; y <= targetYears; y++) { pts.push({ year: y, value: val }); for (let m = 0; m < 12; m++) val = val * (1 + monthlyReturn) + monthlyContribution; }
+    return pts;
+  }, [totalValue, blendedReturn, monthlyContribution, targetYears]);
+
+  const finalValue = projection[projection.length - 1]?.value || 0;
+  const realFinalValue = finalValue / Math.pow(1 + inflation / 100, targetYears);
+  const sustainableAnnualDraw = finalValue * 0.04;
+  const yearsOfDrawdownCovered = retirementDrawdown ? finalValue / retirementDrawdown : 0;
+  const max = Math.max(...projection.map((p) => p.value), 1);
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+      <Panel title="Asset allocation" sub="Current holdings and expected return assumptions (tunable)">
+        <div style={{ display: 'grid', gridTemplateColumns: '1.4fr 1fr 1fr 1fr', gap: 8, fontSize: 11, color: COLORS.textFaint, marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+          <div>Asset class</div><div>Current value</div><div>Exp. return %/yr</div><div>Share</div>
+        </div>
+        {ASSET_CLASSES.map((c) => {
+          const a = allocations[c.id] || { value: 0, expReturn: c.defaultReturn };
+          const share = totalValue ? (a.value / totalValue) * 100 : 0;
+          return (
+            <div key={c.id} style={{ display: 'grid', gridTemplateColumns: '1.4fr 1fr 1fr 1fr', gap: 8, alignItems: 'center', padding: '6px 0', borderBottom: `1px solid ${COLORS.lineFaint}` }}>
+              <div style={{ fontSize: 13, color: COLORS.text }}>{c.label}</div>
+              <NumInput small value={a.value} onChange={(v) => onUpdateAllocation(c.id, v, a.expReturn)} />
+              <NumInput small prefix="" value={a.expReturn} onChange={(v) => onUpdateAllocation(c.id, a.value, v)} />
+              <div style={{ fontSize: 12, color: COLORS.textDim, fontFamily: 'ui-monospace, monospace' }}>{share.toFixed(0)}%</div>
+            </div>
+          );
+        })}
+        <div style={{ display: 'flex', gap: 24, marginTop: 12, paddingTop: 12, borderTop: `1px solid ${COLORS.line}` }}>
+          <Stat label="Total portfolio" value={fmt(totalValue, { compact: true })} />
+          <Stat label="Blended return" value={`${blendedReturn.toFixed(1)}%`} />
+        </div>
+      </Panel>
+
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 12 }}>
+        <Panel><div style={{ fontSize: 10.5, color: COLORS.textFaint, marginBottom: 3 }}>Monthly contribution</div><NumInput value={monthlyContribution} onChange={(v) => onUpdateSettings({ ...portfolio, monthlyContribution: v })} /></Panel>
+        <Panel><div style={{ fontSize: 10.5, color: COLORS.textFaint, marginBottom: 3 }}>Years to project</div><NumInput prefix="" value={targetYears} onChange={(v) => onUpdateSettings({ ...portfolio, targetYears: v })} /></Panel>
+        <Panel><div style={{ fontSize: 10.5, color: COLORS.textFaint, marginBottom: 3 }}>Inflation assumption %</div><NumInput prefix="" value={inflation} onChange={(v) => onUpdateSettings({ ...portfolio, inflation: v })} /></Panel>
+        <Panel><div style={{ fontSize: 10.5, color: COLORS.textFaint, marginBottom: 3 }}>Target annual drawdown</div><NumInput value={retirementDrawdown} onChange={(v) => onUpdateSettings({ ...portfolio, retirementDrawdown: v })} /></Panel>
+      </div>
+
+      <Panel title="Projected portfolio value" sub={`${targetYears}-year projection at ${blendedReturn.toFixed(1)}% blended return, ${fmt(monthlyContribution)}/mo contribution`}>
+        <svg viewBox="0 0 100 100" style={{ width: '100%', height: 200 }} preserveAspectRatio="none">
+          <path d={projection.map((p, i) => `${i === 0 ? 'M' : 'L'}${(i / targetYears) * 100},${100 - (p.value / max) * 100}`).join(' ')} fill="none" stroke={COLORS.teal} strokeWidth={0.8} vectorEffect="non-scaling-stroke" />
+        </svg>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12, marginTop: 16 }}>
+          <Stat label={`Nominal value in ${targetYears}y`} value={fmt(finalValue, { compact: true })} accent={COLORS.teal} />
+          <Stat label="Real value (today's $)" value={fmt(realFinalValue, { compact: true })} />
+          <Stat label="Sustainable draw (4% rule)" value={`${fmt(sustainableAnnualDraw, { compact: true })}/yr`} accent={COLORS.green} />
+        </div>
+        <div style={{ marginTop: 10, fontSize: 12, color: COLORS.textDim }}>
+          At your target drawdown of {fmt(retirementDrawdown)}/yr, this portfolio funds roughly <strong style={{ color: COLORS.text }}>{yearsOfDrawdownCovered.toFixed(0)} years</strong> at the projected end value (undiscounted — treat as a rough guide, not a guarantee).
+        </div>
+      </Panel>
+
+      <Panel title="Notes" sub="How to read this">
+        <div style={{ fontSize: 12, color: COLORS.textDim, lineHeight: 1.6 }}>
+          Return assumptions are editable per asset class — adjust them to be more or less conservative. This is a deterministic projection (no volatility/sequence-of-returns modelling), so treat it as a planning baseline rather than a guarantee. The 4% rule is a common rough heuristic for sustainable withdrawal, not personalised advice — for actual retirement drawdown strategy, a licensed financial adviser can factor in super preservation age, pension eligibility, and tax.
+        </div>
+      </Panel>
+    </div>
+  );
+}
+
+/* ================= AUTH GATE ================= */
+
+function AuthGate({ onAuthed }) {
+  const [email, setEmail] = useState('');
+  const [sent, setSent] = useState(false);
+  const [error, setError] = useState(null);
+  const [sending, setSending] = useState(false);
+
+  const sendLink = async () => {
+    setError(null); setSending(true);
+    const { error } = await supabase.auth.signInWithOtp({ email: email.trim(), options: { emailRedirectTo: window.location.href } });
+    setSending(false);
+    if (error) setError(error.message); else setSent(true);
+  };
+
+  return (
+    <div style={{ background: COLORS.bg, minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: 'ui-sans-serif, system-ui', color: COLORS.text }}>
+      <div style={{ width: 340, padding: 28, background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 8 }}>
+        <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 4 }}>Finance Control</div>
+        <div style={{ fontSize: 12.5, color: COLORS.textDim, marginBottom: 20 }}>Sign in with a magic link sent to your email. Only household-approved addresses can access data.</div>
+        {sent ? (
+          <div style={{ fontSize: 13, color: COLORS.green, lineHeight: 1.6 }}>Check {email} for a sign-in link. You can close this tab.</div>
+        ) : (
+          <>
+            <TextInput value={email} onChange={setEmail} placeholder="you@example.com" style={{ width: '100%', marginBottom: 10 }} />
+            <Button variant="primary" onClick={sendLink} style={{ width: '100%' }}>{sending ? 'Sending…' : 'Send magic link'}</Button>
+            {error && <div style={{ fontSize: 12, color: COLORS.red, marginTop: 10 }}>{error}</div>}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ================= APP SHELL ================= */
+
+const TABS = [
+  { id: 'budget', label: 'Budget' },
+  { id: 'costcut', label: 'Cost cutting' },
+  { id: 'scenarios', label: 'Scenarios' },
+  { id: 'investments', label: 'Investments & retirement' },
+];
+
+function AppShell({ session }) {
+  const [data, setData] = useState(null);
+  const [loadError, setLoadError] = useState(null);
+  const [tab, setTab] = useState('budget');
+  const userId = session.user.id;
+
+  const reload = useCallback(async () => {
+    try { setData(await fetchAllFinanceData()); }
+    catch (e) { setLoadError(e.message || String(e)); }
+  }, []);
+
+  useEffect(() => { reload(); }, [reload]);
+
+  if (loadError) {
+    return (
+      <div style={{ background: COLORS.bg, minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', color: COLORS.red, fontFamily: 'ui-sans-serif, system-ui', padding: 20, textAlign: 'center' }}>
+        Could not load data: {loadError}. If you just signed up, make sure your email is on the household allowlist.
+      </div>
+    );
+  }
+  if (!data) {
+    return <div style={{ background: COLORS.bg, minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', color: COLORS.textDim, fontFamily: 'ui-sans-serif, system-ui' }}>Loading…</div>;
+  }
+
+  const { budget, scenarioList, portfolio } = data;
+
+  // ---- budget handlers ----
+  const onUpdateMonth = async (monthKey, income, spend) => {
+    setData((d) => ({ ...d, budget: { ...d.budget, months: { ...d.budget.months, [monthKey]: { income, spend } } } }));
+    await saveMonth(monthKey, income, spend, userId);
+  };
+  const onAddIncomeSource = async () => {
+    const id = uid();
+    const src = { id, label: 'New source' };
+    setData((d) => ({ ...d, budget: { ...d.budget, incomeSources: [...d.budget.incomeSources, src] } }));
+    await saveIncomeSource(src);
+  };
+  const onRenameIncomeSource = async (id, label) => {
+    setData((d) => ({ ...d, budget: { ...d.budget, incomeSources: d.budget.incomeSources.map((s) => s.id === id ? { ...s, label } : s) } }));
+    await saveIncomeSource({ id, label });
+  };
+  const onRemoveIncomeSource = async (id) => {
+    setData((d) => ({ ...d, budget: { ...d.budget, incomeSources: d.budget.incomeSources.filter((s) => s.id !== id) } }));
+    await deleteIncomeSource(id);
+  };
+
+  // ---- scenario handlers ----
+  const onAddScenario = async (s) => { setData((d) => ({ ...d, scenarioList: [...d.scenarioList, s] })); await saveScenario(s, userId); };
+  const onUpdateScenario = async (s) => { setData((d) => ({ ...d, scenarioList: d.scenarioList.map((x) => x.id === s.id ? s : x) })); await saveScenario(s, userId); };
+  const onRemoveScenario = async (id) => { setData((d) => ({ ...d, scenarioList: d.scenarioList.filter((s) => s.id !== id) })); await deleteScenario(id); };
+  const onAddEvent = async (scenarioId, ev) => {
+    setData((d) => ({ ...d, scenarioList: d.scenarioList.map((s) => s.id === scenarioId ? { ...s, events: [...s.events, ev] } : s) }));
+    await saveScenarioEvent(scenarioId, ev);
+  };
+  const onUpdateEvent = async (scenarioId, evId, patch) => {
+    setData((d) => ({ ...d, scenarioList: d.scenarioList.map((s) => s.id === scenarioId ? { ...s, events: s.events.map((e) => e.id === evId ? patch : e) } : s) }));
+    await saveScenarioEvent(scenarioId, patch);
+  };
+  const onRemoveEvent = async (scenarioId, evId) => {
+    setData((d) => ({ ...d, scenarioList: d.scenarioList.map((s) => s.id === scenarioId ? { ...s, events: s.events.filter((e) => e.id !== evId) } : s) }));
+    await deleteScenarioEvent(evId);
+  };
+  const onSetHorizon = async (years) => {
+    setData((d) => ({ ...d, scenarioList: d.scenarioList.map((s) => ({ ...s, horizonYears: years })) }));
+    await Promise.all(scenarioList.map((s) => saveScenario({ ...s, horizonYears: years }, userId)));
+  };
+
+  // ---- portfolio handlers ----
+  const onUpdateSettings = async (p) => { setData((d) => ({ ...d, portfolio: p })); await savePortfolioSettings(p, userId); };
+  const onUpdateAllocation = async (assetClassId, value, expReturn) => {
+    setData((d) => ({ ...d, portfolio: { ...d.portfolio, allocations: { ...d.portfolio.allocations, [assetClassId]: { value, expReturn } } } }));
+    await savePortfolioAllocation(assetClassId, value, expReturn, userId);
+  };
+
+  // ---- runway strip figures ----
+  const month = nowMonthKey();
+  const monthData = budget.months?.[month] || { income: {}, spend: {} };
+  const incomeSources = budget.incomeSources || [];
+  const totalIncome = incomeSources.reduce((s, src) => s + (monthData.income[src.id] || 0), 0);
+  const totalSpend = CATEGORY_DEFS.reduce((s, c) => s + (monthData.spend[c.id] || 0), 0);
+  const monthlySurplus = totalIncome - totalSpend;
+  const netCash = Object.values(budget.months || {}).reduce((sum, m) => {
+    const inc = incomeSources.reduce((s, src) => s + (m.income?.[src.id] || 0), 0);
+    const sp = CATEGORY_DEFS.reduce((s, c) => s + (m.spend?.[c.id] || 0), 0);
+    return sum + (inc - sp);
+  }, 0);
+  const runwayMonths = monthlySurplus < 0 && netCash > 0 ? netCash / Math.abs(monthlySurplus) : (monthlySurplus >= 0 ? 999 : 0);
+
+  return (
+    <div style={{ background: COLORS.bg, minHeight: '100vh', fontFamily: 'ui-sans-serif, -apple-system, "Segoe UI", system-ui', color: COLORS.text }}>
+      <div style={{ borderBottom: `1px solid ${COLORS.line}`, padding: '16px 20px 0' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
+          <div style={{ fontSize: 16, fontWeight: 700, letterSpacing: '-0.01em' }}>Finance Control</div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <span style={{ fontSize: 11.5, color: COLORS.textDim }}>{session.user.email}</span>
+            <Button small variant="ghost" onClick={() => supabase.auth.signOut()}>Sign out</Button>
+          </div>
+        </div>
+        <div style={{ display: 'flex', gap: 4 }}>
+          {TABS.map((t) => (
+            <button key={t.id} onClick={() => setTab(t.id)} style={{ padding: '8px 14px', fontSize: 13, cursor: 'pointer', background: 'transparent', border: 'none', borderBottom: `2px solid ${tab === t.id ? COLORS.teal : 'transparent'}`, color: tab === t.id ? COLORS.text : COLORS.textDim, fontWeight: tab === t.id ? 600 : 400 }}>{t.label}</button>
+          ))}
+        </div>
+      </div>
+
+      <RunwayStrip netCash={netCash} monthlySurplus={monthlySurplus} runwayMonths={runwayMonths} />
+
+      <div style={{ padding: 20, maxWidth: 1100, margin: '0 auto' }}>
+        {tab === 'budget' && <BudgetModule budget={budget} onUpdateMonth={onUpdateMonth} onAddIncomeSource={onAddIncomeSource} onRenameIncomeSource={onRenameIncomeSource} onRemoveIncomeSource={onRemoveIncomeSource} />}
+        {tab === 'costcut' && <CostCuttingModule budget={budget} />}
+        {tab === 'scenarios' && <ScenariosModule scenarios={scenarioList} onAddScenario={onAddScenario} onUpdateScenario={onUpdateScenario} onRemoveScenario={onRemoveScenario} onAddEvent={onAddEvent} onUpdateEvent={onUpdateEvent} onRemoveEvent={onRemoveEvent} onSetHorizon={onSetHorizon} />}
+        {tab === 'investments' && <InvestmentModule portfolio={portfolio} onUpdateSettings={onUpdateSettings} onUpdateAllocation={onUpdateAllocation} />}
+      </div>
+    </div>
+  );
+}
+
+function Root() {
+  const [session, setSession] = useState(undefined); // undefined = loading, null = signed out
+
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => setSession(data.session));
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, sess) => setSession(sess));
+    return () => sub.subscription.unsubscribe();
+  }, []);
+
+  if (session === undefined) {
+    return <div style={{ background: COLORS.bg, minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', color: COLORS.textDim, fontFamily: 'ui-sans-serif, system-ui' }}>Loading…</div>;
+  }
+  if (!session) return <AuthGate />;
+  return <AppShell session={session} />;
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<Root />);
+</script>
+</body>
+</html>
