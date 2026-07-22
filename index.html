@@ -84,11 +84,35 @@ const fmt = (n, opts = {}) => {
 const monthLabel = (key) => { const [y, m] = key.split('-').map(Number); return new Date(y, m - 1, 1).toLocaleDateString('en-AU', { month: 'short', year: '2-digit' }); };
 const addMonths = (key, n) => { const [y, m] = key.split('-').map(Number); const d = new Date(y, m - 1 + n, 1); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`; };
 const uid = () => (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2, 10));
+const monthTotalIncome = (monthData, incomeSources) => monthData.fromTransactions
+  ? (monthData.income.bank_income || 0)
+  : incomeSources.reduce((s, src) => s + (monthData.income[src.id] || 0), 0);
 
 /* ================= SUPABASE DATA LAYER ================= */
 
+const TXN_INCOME_CATEGORIES = new Set(['Income', 'Interest', 'Other income', 'Transfers in']);
+const TXN_EXCLUDED_CATEGORIES = new Set(['Internal transfers', 'Refund']);
+
+function aggregateTransactionMonths(transactions, categoryMap) {
+  const months = {};
+  (transactions || []).forEach((t) => {
+    if (t.is_internal_transfer || t.is_notification) return;
+    const cat = t.category || 'Uncategorised';
+    if (TXN_EXCLUDED_CATEGORIES.has(cat)) return;
+    const mk = t.txn_date.slice(0, 7);
+    if (!months[mk]) months[mk] = { income: 0, spend: {} };
+    if (TXN_INCOME_CATEGORIES.has(cat)) {
+      months[mk].income += Number(t.amount);
+    } else {
+      const appCat = categoryMap[cat] || 'other';
+      months[mk].spend[appCat] = (months[mk].spend[appCat] || 0) + (-Number(t.amount));
+    }
+  });
+  return months;
+}
+
 async function fetchAllFinanceData() {
-  const [income, months, targets, scenarios, events, portSettings, portAlloc] = await Promise.all([
+  const [income, months, targets, scenarios, events, portSettings, portAlloc, transactions, categoryMapRows] = await Promise.all([
     supabase.from('budget_income_sources').select('*').order('created_at'),
     supabase.from('budget_months').select('*'),
     supabase.from('budget_targets').select('*'),
@@ -96,8 +120,10 @@ async function fetchAllFinanceData() {
     supabase.from('scenario_events').select('*'),
     supabase.from('portfolio_settings').select('*').eq('id', 1).maybeSingle(),
     supabase.from('portfolio_allocations').select('*'),
+    supabase.from('transactions').select('txn_date, amount, category, is_internal_transfer, is_notification'),
+    supabase.from('bank_category_map').select('*'),
   ]);
-  const errs = [income.error, months.error, targets.error, scenarios.error, events.error, portSettings.error, portAlloc.error].filter(Boolean);
+  const errs = [income.error, months.error, targets.error, scenarios.error, events.error, portSettings.error, portAlloc.error, transactions.error, categoryMapRows.error].filter(Boolean);
   if (errs.length) throw errs[0];
 
   const budget = {
@@ -107,6 +133,13 @@ async function fetchAllFinanceData() {
   };
   (months.data || []).forEach((r) => { budget.months[r.month_key] = { income: r.income || {}, spend: r.spend || {} }; });
   (targets.data || []).forEach((r) => { budget.targets[r.category_id] = Number(r.target); });
+
+  const categoryMap = {};
+  (categoryMapRows.data || []).forEach((r) => { categoryMap[r.bank_category] = r.app_category_id; });
+  const txnMonths = aggregateTransactionMonths(transactions.data, categoryMap);
+  Object.entries(txnMonths).forEach(([mk, agg]) => {
+    budget.months[mk] = { income: { bank_income: agg.income }, spend: agg.spend, fromTransactions: true };
+  });
 
   const scenarioList = (scenarios.data || []).map((s) => ({
     id: s.id, name: s.name, startNetWorth: Number(s.start_net_worth), startCash: Number(s.start_cash),
@@ -276,7 +309,7 @@ function WaterfallChart({ budget, incomeSources }) {
     let inc = 0; const cats = {};
     months.forEach((mk) => {
       const md = budget.months?.[mk] || { income: {}, spend: {} };
-      inc += incomeSources.reduce((s, src) => s + (md.income[src.id] || 0), 0);
+      inc += monthTotalIncome(md, incomeSources);
       CATEGORY_DEFS.forEach((c) => { cats[c.id] = (cats[c.id] || 0) + (md.spend[c.id] || 0); });
     });
     return { totalIncome: inc, catTotals: cats };
@@ -357,7 +390,8 @@ function BudgetModule({ budget, onUpdateMonth, onAddIncomeSource, onRenameIncome
   const [month, setMonth] = useState(nowMonthKey());
   const monthData = budget.months?.[month] || { income: {}, spend: {} };
   const incomeSources = budget.incomeSources || [];
-  const totalIncome = incomeSources.reduce((s, src) => s + (monthData.income[src.id] || 0), 0);
+  const locked = !!monthData.fromTransactions;
+  const totalIncome = monthTotalIncome(monthData, incomeSources);
   const totalSpend = CATEGORY_DEFS.reduce((s, c) => s + (monthData.spend[c.id] || 0), 0);
   const surplus = totalIncome - totalSpend;
 
@@ -377,6 +411,11 @@ function BudgetModule({ budget, onUpdateMonth, onAddIncomeSource, onRenameIncome
           <div style={{ fontFamily: 'ui-monospace, monospace', fontSize: 14, color: COLORS.text, minWidth: 80, textAlign: 'center' }}>{monthLabel(month)}</div>
           <Button small onClick={() => setMonth(addMonths(month, 1))}>→</Button>
           {month !== nowMonthKey() && <Button small variant="ghost" onClick={() => setMonth(nowMonthKey())}>Today</Button>}
+          {locked && (
+            <span style={{ fontSize: 10.5, color: COLORS.teal, background: `${COLORS.teal}22`, border: `1px solid ${COLORS.tealDim}`, borderRadius: 4, padding: '3px 8px', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+              From bank transactions
+            </span>
+          )}
         </div>
       </div>
 
@@ -388,16 +427,24 @@ function BudgetModule({ budget, onUpdateMonth, onAddIncomeSource, onRenameIncome
       </div>
 
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
-        <Panel title="Income" sub="By source, this month" right={<Button small variant="ghost" onClick={() => onAddIncomeSource()}>+ Source</Button>}>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            {incomeSources.map((src) => (
-              <div key={src.id} style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                <TextInput value={src.label} onChange={(v) => onRenameIncomeSource(src.id, v)} style={{ flex: 1 }} />
-                <div style={{ width: 130 }}><NumInput value={monthData.income[src.id] || 0} onChange={(v) => setIncome(src.id, v)} /></div>
-                {incomeSources.length > 1 && <Button small variant="ghost" onClick={() => onRemoveIncomeSource(src.id)}>✕</Button>}
-              </div>
-            ))}
-          </div>
+        <Panel title="Income" sub={locked ? 'From bank transactions this month' : 'By source, this month'} right={!locked && <Button small variant="ghost" onClick={() => onAddIncomeSource()}>+ Source</Button>}>
+          {locked ? (
+            <div style={{ fontSize: 13, color: COLORS.text }}>
+              <div style={{ fontSize: 11, color: COLORS.textDim, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 4 }}>Bank income (auto)</div>
+              <div style={{ fontSize: 22, fontFamily: 'ui-monospace, monospace', fontWeight: 600 }}>{fmt(monthData.income.bank_income || 0, { compact: true })}</div>
+              <div style={{ fontSize: 11.5, color: COLORS.textFaint, marginTop: 6 }}>Computed from your linked accounts — not editable.</div>
+            </div>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              {incomeSources.map((src) => (
+                <div key={src.id} style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                  <TextInput value={src.label} onChange={(v) => onRenameIncomeSource(src.id, v)} style={{ flex: 1 }} />
+                  <div style={{ width: 130 }}><NumInput value={monthData.income[src.id] || 0} onChange={(v) => setIncome(src.id, v)} /></div>
+                  {incomeSources.length > 1 && <Button small variant="ghost" onClick={() => onRemoveIncomeSource(src.id)}>✕</Button>}
+                </div>
+              ))}
+            </div>
+          )}
         </Panel>
 
         <Panel title="Spending by category" sub="This month — highest first, target vs actual">
@@ -424,7 +471,13 @@ function BudgetModule({ budget, onUpdateMonth, onAddIncomeSource, onRenameIncome
                     <div style={{ width: `${Math.min(100, pct)}%`, height: '100%', background: barColor }} />
                   </div>
                   <div style={{ width: 78 }}><NumInput small value={target} onChange={(v) => onUpdateTarget(c.id, v)} /></div>
-                  <div style={{ width: 78 }}><NumInput small value={val} onChange={(v) => setSpend(c.id, v)} /></div>
+                  <div style={{ width: 78 }}>
+                    {locked ? (
+                      <div style={{ fontSize: 12, fontFamily: 'ui-monospace, monospace', color: COLORS.text, textAlign: 'right', padding: '4px 8px' }}>{fmt(val)}</div>
+                    ) : (
+                      <NumInput small value={val} onChange={(v) => setSpend(c.id, v)} />
+                    )}
+                  </div>
                 </div>
               );
             })}
@@ -438,11 +491,11 @@ function BudgetModule({ budget, onUpdateMonth, onAddIncomeSource, onRenameIncome
         <div style={{ display: 'flex', alignItems: 'flex-end', gap: 10, height: 140, padding: '0 4px' }}>
           {trendMonths.map((mk) => {
             const md = budget.months?.[mk] || { income: {}, spend: {} };
-            const inc = incomeSources.reduce((s, src) => s + (md.income[src.id] || 0), 0);
+            const inc = monthTotalIncome(md, incomeSources);
             const sp = CATEGORY_DEFS.reduce((s, c) => s + (md.spend[c.id] || 0), 0);
             const max = Math.max(1, ...trendMonths.map((k) => {
               const d = budget.months?.[k] || { income: {}, spend: {} };
-              return Math.max(incomeSources.reduce((s, src) => s + (d.income[src.id] || 0), 0), CATEGORY_DEFS.reduce((s, c) => s + (d.spend[c.id] || 0), 0));
+              return Math.max(monthTotalIncome(d, incomeSources), CATEGORY_DEFS.reduce((s, c) => s + (d.spend[c.id] || 0), 0));
             }));
             return (
               <div key={mk} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
@@ -487,7 +540,7 @@ function CostCuttingModule({ budget }) {
   const month = nowMonthKey();
   const monthData = budget.months?.[month] || { income: {}, spend: {} };
   const incomeSources = budget.incomeSources || [];
-  const totalIncome = incomeSources.reduce((s, src) => s + (monthData.income[src.id] || 0), 0);
+  const totalIncome = monthTotalIncome(monthData, incomeSources);
   const rows = CATEGORY_DEFS.map((c) => {
     const val = monthData.spend[c.id] || 0;
     const actualPct = totalIncome ? (val / totalIncome) * 100 : 0;
@@ -1155,11 +1208,11 @@ function AppShell({ session }) {
   const month = nowMonthKey();
   const monthData = budget.months?.[month] || { income: {}, spend: {} };
   const incomeSources = budget.incomeSources || [];
-  const totalIncome = incomeSources.reduce((s, src) => s + (monthData.income[src.id] || 0), 0);
+  const totalIncome = monthTotalIncome(monthData, incomeSources);
   const totalSpend = CATEGORY_DEFS.reduce((s, c) => s + (monthData.spend[c.id] || 0), 0);
   const monthlySurplus = totalIncome - totalSpend;
   const netCash = Object.values(budget.months || {}).reduce((sum, m) => {
-    const inc = incomeSources.reduce((s, src) => s + (m.income?.[src.id] || 0), 0);
+    const inc = monthTotalIncome(m, incomeSources);
     const sp = CATEGORY_DEFS.reduce((s, c) => s + (m.spend?.[c.id] || 0), 0);
     return sum + (inc - sp);
   }, 0);
