@@ -88,22 +88,25 @@ const uid = () => (crypto.randomUUID ? crypto.randomUUID() : Math.random().toStr
 /* ================= SUPABASE DATA LAYER ================= */
 
 async function fetchAllFinanceData() {
-  const [income, months, scenarios, events, portSettings, portAlloc] = await Promise.all([
+  const [income, months, targets, scenarios, events, portSettings, portAlloc] = await Promise.all([
     supabase.from('budget_income_sources').select('*').order('created_at'),
     supabase.from('budget_months').select('*'),
+    supabase.from('budget_targets').select('*'),
     supabase.from('scenarios').select('*').order('updated_at'),
     supabase.from('scenario_events').select('*'),
     supabase.from('portfolio_settings').select('*').eq('id', 1).maybeSingle(),
     supabase.from('portfolio_allocations').select('*'),
   ]);
-  const errs = [income.error, months.error, scenarios.error, events.error, portSettings.error, portAlloc.error].filter(Boolean);
+  const errs = [income.error, months.error, targets.error, scenarios.error, events.error, portSettings.error, portAlloc.error].filter(Boolean);
   if (errs.length) throw errs[0];
 
   const budget = {
     incomeSources: (income.data || []).map((r) => ({ id: r.source_key, dbId: r.id, label: r.label })),
     months: {},
+    targets: {},
   };
   (months.data || []).forEach((r) => { budget.months[r.month_key] = { income: r.income || {}, spend: r.spend || {} }; });
+  (targets.data || []).forEach((r) => { budget.targets[r.category_id] = Number(r.target); });
 
   const scenarioList = (scenarios.data || []).map((s) => ({
     id: s.id, name: s.name, startNetWorth: Number(s.start_net_worth), startCash: Number(s.start_cash),
@@ -136,6 +139,9 @@ async function deleteIncomeSource(sourceKey) {
 }
 async function saveMonth(monthKey, income, spend, userId) {
   await supabase.from('budget_months').upsert({ month_key: monthKey, income, spend, updated_by: userId, updated_at: new Date().toISOString() }, { onConflict: 'month_key' });
+}
+async function saveBudgetTarget(categoryId, target, userId) {
+  await supabase.from('budget_targets').upsert({ category_id: categoryId, target, updated_by: userId, updated_at: new Date().toISOString() }, { onConflict: 'category_id' });
 }
 async function saveScenario(s, userId) {
   const { data, error } = await supabase.from('scenarios').upsert({
@@ -253,7 +259,101 @@ function RunwayStrip({ netCash, monthlySurplus, runwayMonths }) {
 
 /* ================= BUDGET MODULE ================= */
 
-function BudgetModule({ budget, onUpdateMonth, onAddIncomeSource, onRenameIncomeSource, onRemoveIncomeSource }) {
+const WATERFALL_PERIODS = [
+  { value: '1', label: 'This month' },
+  { value: '3', label: 'Last 3 months' },
+  { value: '6', label: 'Last 6 months' },
+  { value: '12', label: 'Last 12 months' },
+];
+
+function WaterfallChart({ budget, incomeSources }) {
+  const [periodMonths, setPeriodMonths] = useState(1);
+  const [showAll, setShowAll] = useState(false);
+
+  const months = useMemo(() => { const arr = []; for (let i = periodMonths - 1; i >= 0; i--) arr.push(addMonths(nowMonthKey(), -i)); return arr; }, [periodMonths]);
+
+  const { totalIncome, catTotals } = useMemo(() => {
+    let inc = 0; const cats = {};
+    months.forEach((mk) => {
+      const md = budget.months?.[mk] || { income: {}, spend: {} };
+      inc += incomeSources.reduce((s, src) => s + (md.income[src.id] || 0), 0);
+      CATEGORY_DEFS.forEach((c) => { cats[c.id] = (cats[c.id] || 0) + (md.spend[c.id] || 0); });
+    });
+    return { totalIncome: inc, catTotals: cats };
+  }, [months, budget, incomeSources]);
+
+  const sorted = Object.entries(catTotals).filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]);
+  const totalSpend = sorted.reduce((s, [, v]) => s + v, 0);
+
+  let shown = sorted, otherTotal = 0, otherCount = 0;
+  if (!showAll) {
+    let cum = 0; const threshold = totalSpend * 0.85; const keep = [];
+    sorted.forEach(([id, v]) => {
+      if (cum < threshold) { keep.push([id, v]); cum += v; } else { otherTotal += v; otherCount += 1; }
+    });
+    shown = keep;
+  }
+
+  const bars = [{ key: 'income', label: 'Income', lo: 0, hi: totalIncome, color: COLORS.teal, amount: totalIncome }];
+  let running = totalIncome;
+  shown.forEach(([id, v]) => {
+    const c = CATEGORY_DEFS.find((x) => x.id === id);
+    const lo = running - v, hi = running;
+    bars.push({ key: id, label: c ? c.label : id, lo, hi, color: c && !c.essential ? COLORS.amberDim : COLORS.tealDim, amount: v });
+    running = lo;
+  });
+  if (otherTotal > 0) {
+    const lo = running - otherTotal, hi = running;
+    bars.push({ key: 'other', label: `Other (${otherCount})`, lo, hi, color: COLORS.textFaint, amount: otherTotal });
+    running = lo;
+  }
+  bars.push({ key: 'net', label: 'Net', lo: 0, hi: running, color: running >= 0 ? COLORS.green : COLORS.red, amount: running });
+
+  const allVals = bars.flatMap((b) => [b.lo, b.hi]);
+  const scaleMin = Math.min(0, ...allVals);
+  const scaleMax = Math.max(1, ...allVals);
+  const range = (scaleMax - scaleMin) || 1;
+  const pctOf = (v) => ((v - scaleMin) / range) * 100;
+  const groupedCount = sorted.length - shown.length;
+
+  return (
+    <Panel title="Spend waterfall" sub="Where the money went, cascading from income down to net position"
+      right={
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          <Select value={String(periodMonths)} onChange={(v) => setPeriodMonths(parseInt(v))} options={WATERFALL_PERIODS} />
+          {groupedCount > 0 && (
+            <Button small variant="ghost" onClick={() => setShowAll((s) => !s)}>{showAll ? 'Group small categories' : `Show all (+${groupedCount})`}</Button>
+          )}
+        </div>
+      }
+    >
+      {totalIncome === 0 && totalSpend === 0 ? (
+        <div style={{ color: COLORS.textFaint, fontSize: 13 }}>No income or spend recorded for this period yet.</div>
+      ) : (
+        <>
+          <div style={{ display: 'flex', alignItems: 'flex-end', gap: 6, height: 220, padding: '0 2px', overflowX: 'auto' }}>
+            {bars.map((b) => {
+              const lo = Math.min(b.lo, b.hi), hi = Math.max(b.lo, b.hi);
+              const bottomPct = pctOf(lo), topPct = pctOf(hi);
+              return (
+                <div key={b.key} style={{ position: 'relative', flex: '0 0 auto', width: 46, height: '100%' }} title={`${b.label}: ${fmt(b.amount, { compact: true })}`}>
+                  <div style={{ position: 'absolute', left: 0, right: 0, bottom: `${bottomPct}%`, height: `${Math.max(1, topPct - bottomPct)}%`, background: b.color, borderRadius: 2 }} />
+                </div>
+              );
+            })}
+          </div>
+          <div style={{ display: 'flex', gap: 6, marginTop: 6, padding: '0 2px' }}>
+            {bars.map((b) => (
+              <div key={b.key} style={{ width: 46, fontSize: 9, color: COLORS.textFaint, textAlign: 'center', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={b.label}>{b.label}</div>
+            ))}
+          </div>
+        </>
+      )}
+    </Panel>
+  );
+}
+
+function BudgetModule({ budget, onUpdateMonth, onAddIncomeSource, onRenameIncomeSource, onRemoveIncomeSource, onUpdateTarget }) {
   const [month, setMonth] = useState(nowMonthKey());
   const monthData = budget.months?.[month] || { income: {}, spend: {} };
   const incomeSources = budget.incomeSources || [];
@@ -300,26 +400,39 @@ function BudgetModule({ budget, onUpdateMonth, onAddIncomeSource, onRenameIncome
           </div>
         </Panel>
 
-        <Panel title="Spending by category" sub="This month — highest first">
+        <Panel title="Spending by category" sub="This month — highest first, target vs actual">
+          <div style={{ display: 'flex', gap: 8, fontSize: 10, color: COLORS.textFaint, textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: 4, paddingRight: 2 }}>
+            <div style={{ width: 118 }}>Category</div>
+            <div style={{ flex: 1 }} />
+            <div style={{ width: 78, textAlign: 'center' }}>Target</div>
+            <div style={{ width: 78, textAlign: 'center' }}>Actual</div>
+          </div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 7, maxHeight: 320, overflowY: 'auto' }}>
             {sortedCats.map((c) => {
               const val = monthData.spend[c.id] || 0;
-              const pct = totalSpend ? (val / totalSpend) * 100 : 0;
+              const target = budget.targets?.[c.id] || 0;
+              const hasTarget = target > 0;
+              const overTarget = hasTarget && val > target;
+              const pct = hasTarget ? Math.min(100, (val / target) * 100) : (totalSpend ? (val / totalSpend) * 100 : 0);
+              const barColor = hasTarget ? (overTarget ? COLORS.red : COLORS.green) : (c.essential ? COLORS.tealDim : COLORS.amberDim);
               return (
                 <div key={c.id} style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                  <div style={{ width: 130, fontSize: 12.5, color: c.essential ? COLORS.textDim : COLORS.text, display: 'flex', alignItems: 'center', gap: 5 }}>
+                  <div style={{ width: 118, fontSize: 12.5, color: c.essential ? COLORS.textDim : COLORS.text, display: 'flex', alignItems: 'center', gap: 5 }}>
                     {!c.essential && <span style={{ width: 5, height: 5, borderRadius: 3, background: COLORS.amber, display: 'inline-block' }} />}{c.label}
                   </div>
                   <div style={{ flex: 1, height: 14, background: COLORS.panelAlt, borderRadius: 2, overflow: 'hidden' }}>
-                    <div style={{ width: `${Math.min(100, pct)}%`, height: '100%', background: c.essential ? COLORS.tealDim : COLORS.amberDim }} />
+                    <div style={{ width: `${Math.min(100, pct)}%`, height: '100%', background: barColor }} />
                   </div>
-                  <div style={{ width: 90 }}><NumInput small value={val} onChange={(v) => setSpend(c.id, v)} /></div>
+                  <div style={{ width: 78 }}><NumInput small value={target} onChange={(v) => onUpdateTarget(c.id, v)} /></div>
+                  <div style={{ width: 78 }}><NumInput small value={val} onChange={(v) => setSpend(c.id, v)} /></div>
                 </div>
               );
             })}
           </div>
         </Panel>
       </div>
+
+      <WaterfallChart budget={budget} incomeSources={incomeSources} />
 
       <Panel title="6-month trend" sub="Income vs spend">
         <div style={{ display: 'flex', alignItems: 'flex-end', gap: 10, height: 140, padding: '0 4px' }}>
@@ -428,6 +541,56 @@ function CostCuttingModule({ budget }) {
           </Panel>
         </>
       )}
+    </div>
+  );
+}
+
+/* ================= SPENDING DETAIL MODULE ================= */
+
+function SpendingDetailModule({ budget }) {
+  const monthKeys = useMemo(() => Object.keys(budget.months || {}).sort(), [budget.months]);
+  const rowTotal = (catId) => monthKeys.reduce((s, mk) => s + ((budget.months[mk].spend || {})[catId] || 0), 0);
+  const colTotal = (mk) => CATEGORY_DEFS.reduce((s, c) => s + ((budget.months[mk].spend || {})[c.id] || 0), 0);
+  const grandTotal = monthKeys.reduce((s, mk) => s + colTotal(mk), 0);
+  const thStyle = { textAlign: 'right', padding: '6px 10px', color: COLORS.textDim, borderBottom: `1px solid ${COLORS.line}`, whiteSpace: 'nowrap' };
+  const tdStyle = { textAlign: 'right', padding: '6px 10px', color: COLORS.textDim, borderBottom: `1px solid ${COLORS.lineFaint}`, fontFamily: 'ui-monospace, monospace' };
+  const stickyCol = { position: 'sticky', left: 0, background: COLORS.panel };
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+      <Panel title="Spending detail" sub="Every recorded amount by category and month — no balances, just the raw detail">
+        {monthKeys.length === 0 ? (
+          <div style={{ color: COLORS.textFaint, fontSize: 13 }}>No spend recorded yet — enter some in the Budget tab first.</div>
+        ) : (
+          <div style={{ overflowX: 'auto' }}>
+            <table style={{ borderCollapse: 'collapse', width: '100%', fontSize: 12.5 }}>
+              <thead>
+                <tr>
+                  <th style={{ ...thStyle, ...stickyCol, textAlign: 'left' }}>Category</th>
+                  {monthKeys.map((mk) => <th key={mk} style={thStyle}>{monthLabel(mk)}</th>)}
+                  <th style={{ ...thStyle, color: COLORS.text, fontWeight: 600 }}>Total</th>
+                </tr>
+              </thead>
+              <tbody>
+                {CATEGORY_DEFS.map((c) => (
+                  <tr key={c.id}>
+                    <td style={{ padding: '6px 10px', color: c.essential ? COLORS.textDim : COLORS.text, borderBottom: `1px solid ${COLORS.lineFaint}`, whiteSpace: 'nowrap', ...stickyCol }}>{c.label}</td>
+                    {monthKeys.map((mk) => <td key={mk} style={tdStyle}>{fmt((budget.months[mk].spend || {})[c.id] || 0)}</td>)}
+                    <td style={{ ...tdStyle, color: COLORS.text, fontWeight: 600 }}>{fmt(rowTotal(c.id))}</td>
+                  </tr>
+                ))}
+              </tbody>
+              <tfoot>
+                <tr>
+                  <td style={{ padding: '6px 10px', color: COLORS.text, fontWeight: 600, ...stickyCol }}>Total</td>
+                  {monthKeys.map((mk) => <td key={mk} style={{ ...tdStyle, color: COLORS.text, fontWeight: 600 }}>{fmt(colTotal(mk))}</td>)}
+                  <td style={{ ...tdStyle, color: COLORS.text, fontWeight: 700 }}>{fmt(grandTotal)}</td>
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+        )}
+      </Panel>
     </div>
   );
 }
@@ -907,6 +1070,7 @@ const TABS = [
   { id: 'scenarios', label: 'Scenarios' },
   { id: 'investments', label: 'Investments & retirement' },
   { id: 'assistant', label: 'Assistant' },
+  { id: 'detail', label: 'Spending Detail' },
 ];
 
 function AppShell({ session }) {
@@ -953,6 +1117,10 @@ function AppShell({ session }) {
   const onRemoveIncomeSource = async (id) => {
     setData((d) => ({ ...d, budget: { ...d.budget, incomeSources: d.budget.incomeSources.filter((s) => s.id !== id) } }));
     await deleteIncomeSource(id);
+  };
+  const onUpdateTarget = async (categoryId, target) => {
+    setData((d) => ({ ...d, budget: { ...d.budget, targets: { ...d.budget.targets, [categoryId]: target } } }));
+    await saveBudgetTarget(categoryId, target, userId);
   };
 
   // ---- scenario handlers ----
@@ -1017,11 +1185,12 @@ function AppShell({ session }) {
       <RunwayStrip netCash={netCash} monthlySurplus={monthlySurplus} runwayMonths={runwayMonths} />
 
       <div style={{ padding: 20, maxWidth: 1100, margin: '0 auto' }}>
-        {tab === 'budget' && <BudgetModule budget={budget} onUpdateMonth={onUpdateMonth} onAddIncomeSource={onAddIncomeSource} onRenameIncomeSource={onRenameIncomeSource} onRemoveIncomeSource={onRemoveIncomeSource} />}
+        {tab === 'budget' && <BudgetModule budget={budget} onUpdateMonth={onUpdateMonth} onAddIncomeSource={onAddIncomeSource} onRenameIncomeSource={onRenameIncomeSource} onRemoveIncomeSource={onRemoveIncomeSource} onUpdateTarget={onUpdateTarget} />}
         {tab === 'costcut' && <CostCuttingModule budget={budget} />}
         {tab === 'scenarios' && <ScenariosModule scenarios={scenarioList} onAddScenario={onAddScenario} onUpdateScenario={onUpdateScenario} onRemoveScenario={onRemoveScenario} onAddEvent={onAddEvent} onUpdateEvent={onUpdateEvent} onRemoveEvent={onRemoveEvent} onSetHorizon={onSetHorizon} />}
         {tab === 'investments' && <InvestmentModule portfolio={portfolio} onUpdateSettings={onUpdateSettings} onUpdateAllocation={onUpdateAllocation} />}
         {tab === 'assistant' && <AssistantModule budget={budget} scenarioList={scenarioList} portfolio={portfolio} onUpdateMonth={onUpdateMonth} onAddIncomeSource={onAddIncomeSource} onRenameIncomeSource={onRenameIncomeSource} onRemoveIncomeSource={onRemoveIncomeSource} onAddScenario={onAddScenario} onUpdateScenario={onUpdateScenario} onRemoveScenario={onRemoveScenario} onAddEvent={onAddEvent} onRemoveEvent={onRemoveEvent} onUpdateSettings={onUpdateSettings} onUpdateAllocation={onUpdateAllocation} />}
+        {tab === 'detail' && <SpendingDetailModule budget={budget} />}
       </div>
     </div>
   );
