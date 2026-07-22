@@ -288,7 +288,7 @@ function BudgetModule({ budget, onUpdateMonth, onAddIncomeSource, onRenameIncome
       </div>
 
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
-        <Panel title="Income" sub="By source, this month" right={<Button small variant="ghost" onClick={onAddIncomeSource}>+ Source</Button>}>
+        <Panel title="Income" sub="By source, this month" right={<Button small variant="ghost" onClick={() => onAddIncomeSource()}>+ Source</Button>}>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
             {incomeSources.map((src) => (
               <div key={src.id} style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
@@ -694,6 +694,177 @@ function InvestmentModule({ portfolio, onUpdateSettings, onUpdateAllocation }) {
   );
 }
 
+/* ================= ASSISTANT MODULE ================= */
+
+function describeAssistantAction(action, ctx) {
+  const { type, input: a } = action;
+  const incomeLabel = (id) => ctx.incomeSources.find((s) => s.id === id)?.label || id;
+  const catLabel = (id) => (CATEGORY_DEFS.find((c) => c.id === id) || {}).label || id;
+  const assetLabel = (id) => (ASSET_CLASSES.find((c) => c.id === id) || {}).label || id;
+  const scenarioName = (id) => (ctx.scenarioList.find((s) => s.id === id) || {}).name || 'scenario';
+  switch (type) {
+    case 'update_budget_month': {
+      const parts = [];
+      Object.entries(a.incomeChanges || {}).forEach(([id, v]) => parts.push(`${incomeLabel(id)} income → ${fmt(v)}`));
+      Object.entries(a.spendChanges || {}).forEach(([id, v]) => parts.push(`${catLabel(id)} spend → ${fmt(v)}`));
+      return `${monthLabel(a.monthKey)}: ${parts.join(', ') || 'no changes'}`;
+    }
+    case 'add_income_source': return `Add income source "${a.label}"`;
+    case 'rename_income_source': return `Rename income source to "${a.label}"`;
+    case 'remove_income_source': return `Remove income source "${incomeLabel(a.sourceId)}"`;
+    case 'create_scenario': return `Create scenario "${a.name}"${a.events?.length ? ` with ${a.events.length} event(s)` : ''}`;
+    case 'update_scenario_fields': return `Update scenario "${scenarioName(a.scenarioId)}"`;
+    case 'add_scenario_event': return `Add event "${a.label}" to "${scenarioName(a.scenarioId)}"`;
+    case 'remove_scenario_event': return `Remove an event from "${scenarioName(a.scenarioId)}"`;
+    case 'remove_scenario': return `Delete scenario "${scenarioName(a.scenarioId)}"`;
+    case 'update_portfolio_settings': return 'Update portfolio settings';
+    case 'update_portfolio_allocation': return `Update ${assetLabel(a.assetClassId)} allocation`;
+    default: return type;
+  }
+}
+
+function AssistantModule({ budget, scenarioList, portfolio, onUpdateMonth, onAddIncomeSource, onRenameIncomeSource, onRemoveIncomeSource, onAddScenario, onUpdateScenario, onRemoveScenario, onAddEvent, onRemoveEvent, onUpdateSettings, onUpdateAllocation }) {
+  const [messages, setMessages] = useState([
+    { role: 'assistant', text: 'Tell me what to change — e.g. "bump groceries to $900 this month" or "create a scenario where we sell the house in 2027". I’ll show you what I’m about to do before touching anything.' },
+  ]);
+  const [pendingActions, setPendingActions] = useState([]);
+  const [input, setInput] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const scrollRef = useRef(null);
+
+  useEffect(() => { if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight; }, [messages, pendingActions]);
+
+  const buildContext = () => {
+    const month = nowMonthKey();
+    const recentMonths = {};
+    for (let i = 2; i >= 0; i--) { const mk = addMonths(month, -i); recentMonths[mk] = budget.months?.[mk] || { income: {}, spend: {} }; }
+    return {
+      nowMonth: month,
+      incomeSources: budget.incomeSources,
+      recentMonths,
+      scenarios: scenarioList.map((s) => ({ id: s.id, name: s.name, startNetWorth: s.startNetWorth, startCash: s.startCash, baseMonthlyIncome: s.baseMonthlyIncome, baseMonthlyExpense: s.baseMonthlyExpense, horizonYears: s.horizonYears, events: s.events })),
+      portfolio,
+    };
+  };
+
+  const send = async () => {
+    const text = input.trim();
+    if (!text || loading) return;
+    setInput('');
+    setError(null);
+    setPendingActions([]);
+    const nextMessages = [...messages, { role: 'user', text }];
+    setMessages(nextMessages);
+    setLoading(true);
+    try {
+      let hist = nextMessages.slice(0, -1);
+      while (hist.length && hist[0].role !== 'user') hist.shift();
+      const history = hist.slice(-8).map((m) => ({ role: m.role, content: m.text }));
+      const { data, error: fnError } = await supabase.functions.invoke('chat-assistant', { body: { message: text, context: buildContext(), history } });
+      if (fnError) throw fnError;
+      if (data?.error) throw new Error(data.error);
+      setMessages((m) => [...m, { role: 'assistant', text: data.reply || '(no reply)' }]);
+      setPendingActions(data.actions || []);
+    } catch (e) {
+      setError(e.message || String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const applyActions = async () => {
+    const actionsToApply = pendingActions;
+    for (const action of actionsToApply) {
+      const { type, input: a } = action;
+      try {
+        if (type === 'update_budget_month') {
+          const md = budget.months?.[a.monthKey] || { income: {}, spend: {} };
+          await onUpdateMonth(a.monthKey, { ...md.income, ...(a.incomeChanges || {}) }, { ...md.spend, ...(a.spendChanges || {}) });
+        } else if (type === 'add_income_source') {
+          await onAddIncomeSource(a.label);
+        } else if (type === 'rename_income_source') {
+          await onRenameIncomeSource(a.sourceId, a.label);
+        } else if (type === 'remove_income_source') {
+          await onRemoveIncomeSource(a.sourceId);
+        } else if (type === 'create_scenario') {
+          const scenario = { id: uid(), name: a.name, startNetWorth: a.startNetWorth || 0, startCash: a.startCash || 0, baseMonthlyIncome: a.baseMonthlyIncome || 0, baseMonthlyExpense: a.baseMonthlyExpense || 0, horizonYears: a.horizonYears || 10, events: [] };
+          await onAddScenario(scenario);
+          for (const ev of (a.events || [])) {
+            await onAddEvent(scenario.id, { id: uid(), label: ev.label, type: ev.type, amount: ev.amount, startMonth: ev.startMonth, endMonth: ev.endMonth ?? null });
+          }
+        } else if (type === 'update_scenario_fields') {
+          const s = scenarioList.find((sc) => sc.id === a.scenarioId);
+          if (s) { const { scenarioId, ...fields } = a; await onUpdateScenario({ ...s, ...fields }); }
+        } else if (type === 'add_scenario_event') {
+          await onAddEvent(a.scenarioId, { id: uid(), label: a.label, type: a.type, amount: a.amount, startMonth: a.startMonth, endMonth: a.endMonth ?? null });
+        } else if (type === 'remove_scenario_event') {
+          await onRemoveEvent(a.scenarioId, a.eventId);
+        } else if (type === 'remove_scenario') {
+          await onRemoveScenario(a.scenarioId);
+        } else if (type === 'update_portfolio_settings') {
+          const fields = {};
+          ['monthlyContribution', 'targetYears', 'inflation', 'retirementDrawdown'].forEach((k) => { if (a[k] !== undefined) fields[k] = a[k]; });
+          await onUpdateSettings({ ...portfolio, ...fields });
+        } else if (type === 'update_portfolio_allocation') {
+          const current = portfolio.allocations?.[a.assetClassId] || { value: 0, expReturn: (ASSET_CLASSES.find((c) => c.id === a.assetClassId) || {}).defaultReturn || 0 };
+          await onUpdateAllocation(a.assetClassId, a.value !== undefined ? a.value : current.value, a.expReturn !== undefined ? a.expReturn : current.expReturn);
+        }
+      } catch (e) {
+        setError(`Failed to apply "${type}": ${e.message || e}`);
+      }
+    }
+    setMessages((m) => [...m, { role: 'assistant', text: `Applied ${actionsToApply.length} change${actionsToApply.length !== 1 ? 's' : ''}.` }]);
+    setPendingActions([]);
+  };
+
+  const ctx = { incomeSources: budget.incomeSources || [], scenarioList };
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+      <Panel title="Assistant" sub="Describe a change in plain language — nothing is saved until you approve it">
+        <div ref={scrollRef} style={{ display: 'flex', flexDirection: 'column', gap: 10, maxHeight: 360, overflowY: 'auto', marginBottom: 12, paddingRight: 4 }}>
+          {messages.map((m, i) => (
+            <div key={i} style={{ alignSelf: m.role === 'user' ? 'flex-end' : 'flex-start', maxWidth: '80%', background: m.role === 'user' ? COLORS.tealDim : COLORS.panelAlt, color: COLORS.text, padding: '8px 12px', borderRadius: 6, fontSize: 13, lineHeight: 1.5 }}>
+              {m.text}
+            </div>
+          ))}
+          {loading && <div style={{ color: COLORS.textFaint, fontSize: 12 }}>Thinking…</div>}
+        </div>
+
+        {pendingActions.length > 0 && (
+          <div style={{ background: COLORS.panelAlt, border: `1px solid ${COLORS.line}`, borderRadius: 6, padding: 12, marginBottom: 12 }}>
+            <div style={{ fontSize: 11.5, color: COLORS.textDim, marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Proposed changes</div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 12 }}>
+              {pendingActions.map((a, i) => (
+                <div key={i} style={{ fontSize: 12.5, color: COLORS.text }}>• {describeAssistantAction(a, ctx)}</div>
+              ))}
+            </div>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <Button variant="primary" small onClick={applyActions}>Apply all changes</Button>
+              <Button variant="ghost" small onClick={() => setPendingActions([])}>Discard</Button>
+            </div>
+          </div>
+        )}
+
+        {error && <div style={{ color: COLORS.red, fontSize: 12, marginBottom: 10 }}>{error}</div>}
+
+        <div style={{ display: 'flex', gap: 8 }}>
+          <input
+            type="text"
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') send(); }}
+            placeholder="e.g. set groceries to $850 this month"
+            style={{ flex: 1, background: COLORS.panelAlt, border: `1px solid ${COLORS.line}`, borderRadius: 4, padding: '8px 10px', color: COLORS.text, fontSize: 13, outline: 'none' }}
+          />
+          <Button variant="primary" onClick={send}>{loading ? '…' : 'Send'}</Button>
+        </div>
+      </Panel>
+    </div>
+  );
+}
+
 /* ================= AUTH GATE ================= */
 
 function AuthGate({ onAuthed }) {
@@ -735,6 +906,7 @@ const TABS = [
   { id: 'costcut', label: 'Cost cutting' },
   { id: 'scenarios', label: 'Scenarios' },
   { id: 'investments', label: 'Investments & retirement' },
+  { id: 'assistant', label: 'Assistant' },
 ];
 
 function AppShell({ session }) {
@@ -768,9 +940,9 @@ function AppShell({ session }) {
     setData((d) => ({ ...d, budget: { ...d.budget, months: { ...d.budget.months, [monthKey]: { income, spend } } } }));
     await saveMonth(monthKey, income, spend, userId);
   };
-  const onAddIncomeSource = async () => {
+  const onAddIncomeSource = async (label) => {
     const id = uid();
-    const src = { id, label: 'New source' };
+    const src = { id, label: typeof label === 'string' && label.trim() ? label.trim() : 'New source' };
     setData((d) => ({ ...d, budget: { ...d.budget, incomeSources: [...d.budget.incomeSources, src] } }));
     await saveIncomeSource(src);
   };
@@ -849,6 +1021,7 @@ function AppShell({ session }) {
         {tab === 'costcut' && <CostCuttingModule budget={budget} />}
         {tab === 'scenarios' && <ScenariosModule scenarios={scenarioList} onAddScenario={onAddScenario} onUpdateScenario={onUpdateScenario} onRemoveScenario={onRemoveScenario} onAddEvent={onAddEvent} onUpdateEvent={onUpdateEvent} onRemoveEvent={onRemoveEvent} onSetHorizon={onSetHorizon} />}
         {tab === 'investments' && <InvestmentModule portfolio={portfolio} onUpdateSettings={onUpdateSettings} onUpdateAllocation={onUpdateAllocation} />}
+        {tab === 'assistant' && <AssistantModule budget={budget} scenarioList={scenarioList} portfolio={portfolio} onUpdateMonth={onUpdateMonth} onAddIncomeSource={onAddIncomeSource} onRenameIncomeSource={onRenameIncomeSource} onRemoveIncomeSource={onRemoveIncomeSource} onAddScenario={onAddScenario} onUpdateScenario={onUpdateScenario} onRemoveScenario={onRemoveScenario} onAddEvent={onAddEvent} onRemoveEvent={onRemoveEvent} onUpdateSettings={onUpdateSettings} onUpdateAllocation={onUpdateAllocation} />}
       </div>
     </div>
   );
