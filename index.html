@@ -93,8 +93,16 @@ const monthTotalIncome = (monthData, incomeSources) => monthData.fromTransaction
 const TXN_INCOME_CATEGORIES = new Set(['Income', 'Interest', 'Other income', 'Transfers in']);
 const TXN_EXCLUDED_CATEGORIES = new Set(['Internal transfers', 'Refund']);
 
-function aggregateTransactionMonths(transactions, categoryMap) {
+function resolveAppCategory(t, categoryMap, vendorMap) {
+  const haystack = `${t.merchant_name || ''} ${t.description || ''}`.toUpperCase();
+  const vendorMatch = (vendorMap || []).find((v) => v.vendor_pattern && haystack.includes(v.vendor_pattern.toUpperCase()));
+  if (vendorMatch) return { categoryId: vendorMatch.category_id, vendorPattern: vendorMatch.vendor_pattern };
+  return { categoryId: categoryMap[t.category || 'Uncategorised'] || 'other', vendorPattern: null };
+}
+
+function aggregateTransactionMonths(transactions, categoryMap, vendorMap) {
   const months = {};
+  const vendorMatchCounts = {};
   (transactions || []).forEach((t) => {
     if (t.is_internal_transfer || t.is_notification) return;
     const cat = t.category || 'Uncategorised';
@@ -104,15 +112,16 @@ function aggregateTransactionMonths(transactions, categoryMap) {
     if (TXN_INCOME_CATEGORIES.has(cat)) {
       months[mk].income += Number(t.amount);
     } else {
-      const appCat = categoryMap[cat] || 'other';
-      months[mk].spend[appCat] = (months[mk].spend[appCat] || 0) + (-Number(t.amount));
+      const { categoryId, vendorPattern } = resolveAppCategory(t, categoryMap, vendorMap);
+      months[mk].spend[categoryId] = (months[mk].spend[categoryId] || 0) + (-Number(t.amount));
+      if (vendorPattern) vendorMatchCounts[vendorPattern] = (vendorMatchCounts[vendorPattern] || 0) + 1;
     }
   });
-  return months;
+  return { months, vendorMatchCounts };
 }
 
 async function fetchAllFinanceData() {
-  const [income, months, targets, scenarios, events, portSettings, portAlloc, transactions, categoryMapRows] = await Promise.all([
+  const [income, months, targets, scenarios, events, portSettings, portAlloc, transactions, categoryMapRows, vendorRows] = await Promise.all([
     supabase.from('budget_income_sources').select('*').order('created_at'),
     supabase.from('budget_months').select('*'),
     supabase.from('budget_targets').select('*'),
@@ -120,10 +129,11 @@ async function fetchAllFinanceData() {
     supabase.from('scenario_events').select('*'),
     supabase.from('portfolio_settings').select('*').eq('id', 1).maybeSingle(),
     supabase.from('portfolio_allocations').select('*'),
-    supabase.from('transactions').select('txn_date, amount, category, is_internal_transfer, is_notification'),
+    supabase.from('transactions').select('txn_date, amount, category, merchant_name, description, is_internal_transfer, is_notification'),
     supabase.from('bank_category_map').select('*'),
+    supabase.from('vendor_category_map').select('*').order('match_count', { ascending: false }),
   ]);
-  const errs = [income.error, months.error, targets.error, scenarios.error, events.error, portSettings.error, portAlloc.error, transactions.error, categoryMapRows.error].filter(Boolean);
+  const errs = [income.error, months.error, targets.error, scenarios.error, events.error, portSettings.error, portAlloc.error, transactions.error, categoryMapRows.error, vendorRows.error].filter(Boolean);
   if (errs.length) throw errs[0];
 
   const budget = {
@@ -136,10 +146,12 @@ async function fetchAllFinanceData() {
 
   const categoryMap = {};
   (categoryMapRows.data || []).forEach((r) => { categoryMap[r.bank_category] = r.app_category_id; });
-  const txnMonths = aggregateTransactionMonths(transactions.data, categoryMap);
+  const vendorList = vendorRows.data || [];
+  const { months: txnMonths, vendorMatchCounts } = aggregateTransactionMonths(transactions.data, categoryMap, vendorList);
   Object.entries(txnMonths).forEach(([mk, agg]) => {
     budget.months[mk] = { income: { bank_income: agg.income }, spend: agg.spend, fromTransactions: true };
   });
+  vendorList.forEach((v) => { v.liveMatchCount = vendorMatchCounts[v.vendor_pattern] || 0; });
 
   const scenarioList = (scenarios.data || []).map((s) => ({
     id: s.id, name: s.name, startNetWorth: Number(s.start_net_worth), startCash: Number(s.start_cash),
@@ -161,7 +173,16 @@ async function fetchAllFinanceData() {
     allocations,
   };
 
-  return { budget, scenarioList, portfolio };
+  return { budget, scenarioList, portfolio, vendorList };
+}
+
+async function saveVendor(vendorPattern, categoryId, notes, userId) {
+  await supabase.from('vendor_category_map').upsert({
+    vendor_pattern: vendorPattern, category_id: categoryId, notes: notes || null, created_by: userId, updated_at: new Date().toISOString(),
+  }, { onConflict: 'vendor_pattern' });
+}
+async function deleteVendor(vendorPattern) {
+  await supabase.from('vendor_category_map').delete().eq('vendor_pattern', vendorPattern);
 }
 
 async function saveIncomeSource(src) {
@@ -648,6 +669,57 @@ function SpendingDetailModule({ budget }) {
   );
 }
 
+/* ================= VENDORS MODULE ================= */
+
+const CATEGORY_OPTIONS = CATEGORY_DEFS.map((c) => ({ value: c.id, label: c.label }));
+
+function VendorsModule({ vendors, onSave, onDelete, onAdd }) {
+  const [filter, setFilter] = useState('');
+  const [newPattern, setNewPattern] = useState('');
+  const [newCategory, setNewCategory] = useState(CATEGORY_DEFS[0].id);
+
+  const filtered = vendors.filter((v) => v.vendor_pattern.toLowerCase().includes(filter.toLowerCase()));
+  const totalLiveMatches = vendors.reduce((s, v) => s + (v.liveMatchCount || 0), 0);
+  const topVendor = [...vendors].sort((a, b) => (b.liveMatchCount || 0) - (a.liveMatchCount || 0))[0];
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12 }}>
+        <Panel><Stat label="Vendors remembered" value={vendors.length} /></Panel>
+        <Panel><Stat label="Transactions matched (current data)" value={totalLiveMatches} /></Panel>
+        <Panel><Stat label="Most-matched vendor" value={topVendor && topVendor.liveMatchCount ? topVendor.vendor_pattern : '—'} /></Panel>
+      </div>
+
+      <Panel title="Add a vendor override" sub="Takes precedence over the default bank-category mapping for any transaction whose merchant or description contains this text">
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          <TextInput value={newPattern} onChange={setNewPattern} placeholder="e.g. UBER EATS" style={{ flex: 1 }} />
+          <Select value={newCategory} onChange={setNewCategory} options={CATEGORY_OPTIONS} />
+          <Button variant="primary" small onClick={() => { if (!newPattern.trim()) return; onAdd(newPattern.trim().toUpperCase(), newCategory); setNewPattern(''); }}>+ Add</Button>
+        </div>
+      </Panel>
+
+      <Panel title="Vendor overrides" sub={`${filtered.length} of ${vendors.length} — matched by merchant name or description, case-insensitive`}
+        right={<TextInput value={filter} onChange={setFilter} placeholder="Filter…" style={{ width: 160 }} />}>
+        <div style={{ display: 'grid', gridTemplateColumns: '2fr 1.4fr 0.9fr 1.4fr auto', gap: 8, fontSize: 11, color: COLORS.textFaint, marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+          <div>Vendor pattern</div><div>Category</div><div>Matches</div><div>Notes</div><div></div>
+        </div>
+        <div style={{ maxHeight: 460, overflowY: 'auto' }}>
+          {filtered.length === 0 && <div style={{ color: COLORS.textFaint, fontSize: 13, padding: '12px 0' }}>No vendor overrides yet — add one above to fix a miscategorised merchant.</div>}
+          {filtered.map((v) => (
+            <div key={v.vendor_pattern} style={{ display: 'grid', gridTemplateColumns: '2fr 1.4fr 0.9fr 1.4fr auto', gap: 8, alignItems: 'center', padding: '7px 0', borderBottom: `1px solid ${COLORS.lineFaint}` }}>
+              <div style={{ fontSize: 12.5, color: COLORS.text, fontFamily: 'ui-monospace, monospace' }}>{v.vendor_pattern}</div>
+              <Select value={v.category_id} onChange={(cat) => onSave(v.vendor_pattern, cat, v.notes)} options={CATEGORY_OPTIONS} style={{ fontSize: 12 }} />
+              <div style={{ fontSize: 12, color: COLORS.textDim, fontFamily: 'ui-monospace, monospace' }}>{v.liveMatchCount || 0}</div>
+              <TextInput value={v.notes || ''} onChange={(n) => onSave(v.vendor_pattern, v.category_id, n)} placeholder="—" style={{ fontSize: 12 }} />
+              <Button small variant="ghost" onClick={() => onDelete(v.vendor_pattern)}>✕</Button>
+            </div>
+          ))}
+        </div>
+      </Panel>
+    </div>
+  );
+}
+
 /* ================= SCENARIOS MODULE ================= */
 
 const EVENT_TYPES = [
@@ -1120,6 +1192,7 @@ function AuthGate({ onAuthed }) {
 const TABS = [
   { id: 'budget', label: 'Budget' },
   { id: 'costcut', label: 'Cost cutting' },
+  { id: 'vendors', label: 'Vendors' },
   { id: 'scenarios', label: 'Scenarios' },
   { id: 'investments', label: 'Investments & retirement' },
   { id: 'assistant', label: 'Assistant' },
@@ -1150,7 +1223,24 @@ function AppShell({ session }) {
     return <div style={{ background: COLORS.bg, minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', color: COLORS.textDim, fontFamily: 'ui-sans-serif, system-ui' }}>Loading…</div>;
   }
 
-  const { budget, scenarioList, portfolio } = data;
+  const { budget, scenarioList, portfolio, vendorList } = data;
+
+  // ---- vendor handlers ----
+  const onSaveVendor = async (pattern, categoryId, notes) => {
+    setData((d) => ({ ...d, vendorList: d.vendorList.map((v) => v.vendor_pattern === pattern ? { ...v, category_id: categoryId, notes } : v) }));
+    await saveVendor(pattern, categoryId, notes, userId);
+    await reload();
+  };
+  const onAddVendor = async (pattern, categoryId) => {
+    setData((d) => ({ ...d, vendorList: [{ vendor_pattern: pattern, category_id: categoryId, match_count: 1, notes: null, liveMatchCount: 0 }, ...d.vendorList] }));
+    await saveVendor(pattern, categoryId, null, userId);
+    await reload();
+  };
+  const onDeleteVendor = async (pattern) => {
+    setData((d) => ({ ...d, vendorList: d.vendorList.filter((v) => v.vendor_pattern !== pattern) }));
+    await deleteVendor(pattern);
+    await reload();
+  };
 
   // ---- budget handlers ----
   const onUpdateMonth = async (monthKey, income, spend) => {
@@ -1240,6 +1330,7 @@ function AppShell({ session }) {
       <div style={{ padding: 20, maxWidth: 1100, margin: '0 auto' }}>
         {tab === 'budget' && <BudgetModule budget={budget} onUpdateMonth={onUpdateMonth} onAddIncomeSource={onAddIncomeSource} onRenameIncomeSource={onRenameIncomeSource} onRemoveIncomeSource={onRemoveIncomeSource} onUpdateTarget={onUpdateTarget} />}
         {tab === 'costcut' && <CostCuttingModule budget={budget} />}
+        {tab === 'vendors' && <VendorsModule vendors={vendorList} onSave={onSaveVendor} onDelete={onDeleteVendor} onAdd={onAddVendor} />}
         {tab === 'scenarios' && <ScenariosModule scenarios={scenarioList} onAddScenario={onAddScenario} onUpdateScenario={onUpdateScenario} onRemoveScenario={onRemoveScenario} onAddEvent={onAddEvent} onUpdateEvent={onUpdateEvent} onRemoveEvent={onRemoveEvent} onSetHorizon={onSetHorizon} />}
         {tab === 'investments' && <InvestmentModule portfolio={portfolio} onUpdateSettings={onUpdateSettings} onUpdateAllocation={onUpdateAllocation} />}
         {tab === 'assistant' && <AssistantModule budget={budget} scenarioList={scenarioList} portfolio={portfolio} onUpdateMonth={onUpdateMonth} onAddIncomeSource={onAddIncomeSource} onRenameIncomeSource={onRenameIncomeSource} onRemoveIncomeSource={onRemoveIncomeSource} onAddScenario={onAddScenario} onUpdateScenario={onUpdateScenario} onRemoveScenario={onRemoveScenario} onAddEvent={onAddEvent} onRemoveEvent={onRemoveEvent} onUpdateSettings={onUpdateSettings} onUpdateAllocation={onUpdateAllocation} />}
