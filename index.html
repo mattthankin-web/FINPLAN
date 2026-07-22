@@ -173,7 +173,7 @@ async function fetchAllFinanceData() {
     allocations,
   };
 
-  return { budget, scenarioList, portfolio, vendorList };
+  return { budget, scenarioList, portfolio, vendorList, categoryMap };
 }
 
 async function saveVendor(vendorPattern, categoryId, notes, userId) {
@@ -621,7 +621,141 @@ function CostCuttingModule({ budget }) {
 
 /* ================= SPENDING DETAIL MODULE ================= */
 
-function SpendingDetailModule({ budget }) {
+const TXN_DISPLAY_LIMIT = 300;
+
+function TransactionExplorer({ categoryMap, vendorList }) {
+  const [rows, setRows] = useState(null);
+  const [loadError, setLoadError] = useState(null);
+  const [search, setSearch] = useState('');
+  const [categoryFilter, setCategoryFilter] = useState('all');
+  const [accountFilter, setAccountFilter] = useState('all');
+  const [fromDate, setFromDate] = useState('');
+  const [toDate, setToDate] = useState('');
+  const [minAmount, setMinAmount] = useState('');
+  const [maxAmount, setMaxAmount] = useState('');
+  const [includeInternal, setIncludeInternal] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const { data, error } = await supabase
+        .from('transactions')
+        .select('transaction_id, txn_date, account_masked, description, merchant_name, category, amount, is_internal_transfer, is_notification')
+        .order('txn_date', { ascending: false });
+      if (cancelled) return;
+      if (error) setLoadError(error.message);
+      else setRows(data || []);
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  const resolved = useMemo(() => {
+    if (!rows) return [];
+    return rows.map((t) => {
+      const cat = t.category || 'Uncategorised';
+      let appCategoryId = null;
+      let kind = 'spend';
+      if (TXN_EXCLUDED_CATEGORIES.has(cat)) kind = 'excluded';
+      else if (TXN_INCOME_CATEGORIES.has(cat)) kind = 'income';
+      else appCategoryId = resolveAppCategory(t, categoryMap, vendorList).categoryId;
+      return { ...t, appCategoryId, kind };
+    });
+  }, [rows, categoryMap, vendorList]);
+
+  const accounts = useMemo(() => Array.from(new Set((rows || []).map((t) => t.account_masked))).filter(Boolean).sort(), [rows]);
+
+  const filtered = useMemo(() => {
+    return resolved.filter((t) => {
+      if (!includeInternal && (t.kind === 'excluded' || t.is_internal_transfer)) return false;
+      if (t.is_notification) return false;
+      if (categoryFilter === 'income' && t.kind !== 'income') return false;
+      else if (categoryFilter !== 'all' && categoryFilter !== 'income' && t.appCategoryId !== categoryFilter) return false;
+      if (accountFilter !== 'all' && t.account_masked !== accountFilter) return false;
+      if (fromDate && t.txn_date < fromDate) return false;
+      if (toDate && t.txn_date > toDate) return false;
+      if (minAmount !== '' && Number(t.amount) < Number(minAmount)) return false;
+      if (maxAmount !== '' && Number(t.amount) > Number(maxAmount)) return false;
+      if (search) {
+        const hay = `${t.description || ''} ${t.merchant_name || ''} ${t.category || ''}`.toLowerCase();
+        if (!hay.includes(search.toLowerCase())) return false;
+      }
+      return true;
+    });
+  }, [resolved, includeInternal, categoryFilter, accountFilter, fromDate, toDate, minAmount, maxAmount, search]);
+
+  const totalAmount = filtered.reduce((s, t) => s + Number(t.amount), 0);
+  const shown = filtered.slice(0, TXN_DISPLAY_LIMIT);
+  const catLabel = (id) => (CATEGORY_DEFS.find((c) => c.id === id) || {}).label || id;
+
+  const categoryFilterOptions = [
+    { value: 'all', label: 'All categories' },
+    { value: 'income', label: 'Income' },
+    ...CATEGORY_DEFS.map((c) => ({ value: c.id, label: c.label })),
+  ];
+  const accountFilterOptions = [{ value: 'all', label: 'All accounts' }, ...accounts.map((a) => ({ value: a, label: a }))];
+
+  return (
+    <Panel title="All transactions" sub="Every row from your linked accounts — filter dynamically, nothing here reloads the page">
+      {loadError && <div style={{ color: COLORS.red, fontSize: 13, marginBottom: 10 }}>Could not load transactions: {loadError}</div>}
+      {!rows ? (
+        <div style={{ color: COLORS.textFaint, fontSize: 13 }}>Loading transactions…</div>
+      ) : (
+        <>
+          <div style={{ display: 'grid', gridTemplateColumns: '1.6fr 1fr 1fr 0.9fr 0.9fr 0.9fr 0.9fr auto', gap: 8, marginBottom: 12, alignItems: 'center' }}>
+            <TextInput value={search} onChange={setSearch} placeholder="Search description/merchant…" />
+            <Select value={categoryFilter} onChange={setCategoryFilter} options={categoryFilterOptions} />
+            <Select value={accountFilter} onChange={setAccountFilter} options={accountFilterOptions} />
+            <input type="date" value={fromDate} onChange={(e) => setFromDate(e.target.value)} style={{ background: COLORS.panelAlt, border: `1px solid ${COLORS.line}`, borderRadius: 4, padding: '6px 8px', color: COLORS.text, fontSize: 12, outline: 'none' }} />
+            <input type="date" value={toDate} onChange={(e) => setToDate(e.target.value)} style={{ background: COLORS.panelAlt, border: `1px solid ${COLORS.line}`, borderRadius: 4, padding: '6px 8px', color: COLORS.text, fontSize: 12, outline: 'none' }} />
+            <NumInput small placeholder="Min" value={minAmount} onChange={(v) => setMinAmount(v === 0 ? '' : v)} />
+            <NumInput small placeholder="Max" value={maxAmount} onChange={(v) => setMaxAmount(v === 0 ? '' : v)} />
+            <label style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, color: COLORS.textDim, whiteSpace: 'nowrap' }}>
+              <input type="checkbox" checked={includeInternal} onChange={(e) => setIncludeInternal(e.target.checked)} />
+              Include transfers
+            </label>
+          </div>
+
+          <div style={{ display: 'flex', gap: 24, marginBottom: 12, fontSize: 12, color: COLORS.textDim }}>
+            <span><strong style={{ color: COLORS.text }}>{filtered.length}</strong> matching{filtered.length > TXN_DISPLAY_LIMIT ? ` (showing first ${TXN_DISPLAY_LIMIT})` : ''}</span>
+            <span>Net of matched: <strong style={{ color: totalAmount >= 0 ? COLORS.green : COLORS.red, fontFamily: 'ui-monospace, monospace' }}>{fmt(totalAmount, { compact: true })}</strong></span>
+          </div>
+
+          <div style={{ overflowX: 'auto', maxHeight: 480, overflowY: 'auto' }}>
+            <table style={{ borderCollapse: 'collapse', width: '100%', fontSize: 12.5 }}>
+              <thead>
+                <tr>
+                  <th style={{ textAlign: 'left', padding: '6px 10px', color: COLORS.textDim, borderBottom: `1px solid ${COLORS.line}`, position: 'sticky', top: 0, background: COLORS.panel }}>Date</th>
+                  <th style={{ textAlign: 'left', padding: '6px 10px', color: COLORS.textDim, borderBottom: `1px solid ${COLORS.line}`, position: 'sticky', top: 0, background: COLORS.panel }}>Description</th>
+                  <th style={{ textAlign: 'left', padding: '6px 10px', color: COLORS.textDim, borderBottom: `1px solid ${COLORS.line}`, position: 'sticky', top: 0, background: COLORS.panel }}>Category</th>
+                  <th style={{ textAlign: 'left', padding: '6px 10px', color: COLORS.textDim, borderBottom: `1px solid ${COLORS.line}`, position: 'sticky', top: 0, background: COLORS.panel }}>Account</th>
+                  <th style={{ textAlign: 'right', padding: '6px 10px', color: COLORS.textDim, borderBottom: `1px solid ${COLORS.line}`, position: 'sticky', top: 0, background: COLORS.panel }}>Amount</th>
+                </tr>
+              </thead>
+              <tbody>
+                {shown.map((t) => (
+                  <tr key={t.transaction_id}>
+                    <td style={{ padding: '5px 10px', color: COLORS.textDim, borderBottom: `1px solid ${COLORS.lineFaint}`, whiteSpace: 'nowrap', fontFamily: 'ui-monospace, monospace', fontSize: 11.5 }}>{t.txn_date}</td>
+                    <td style={{ padding: '5px 10px', color: COLORS.text, borderBottom: `1px solid ${COLORS.lineFaint}` }}>{t.merchant_name || t.description || '—'}</td>
+                    <td style={{ padding: '5px 10px', color: COLORS.textDim, borderBottom: `1px solid ${COLORS.lineFaint}`, whiteSpace: 'nowrap' }}>
+                      {t.kind === 'income' ? 'Income' : t.kind === 'excluded' ? t.category : catLabel(t.appCategoryId)}
+                    </td>
+                    <td style={{ padding: '5px 10px', color: COLORS.textFaint, borderBottom: `1px solid ${COLORS.lineFaint}`, whiteSpace: 'nowrap', fontFamily: 'ui-monospace, monospace', fontSize: 11.5 }}>{t.account_masked}</td>
+                    <td style={{ padding: '5px 10px', textAlign: 'right', borderBottom: `1px solid ${COLORS.lineFaint}`, fontFamily: 'ui-monospace, monospace', color: Number(t.amount) < 0 ? COLORS.text : COLORS.green }}>{fmt(Number(t.amount))}</td>
+                  </tr>
+                ))}
+                {shown.length === 0 && (
+                  <tr><td colSpan={5} style={{ padding: '16px 10px', color: COLORS.textFaint, textAlign: 'center' }}>No transactions match these filters.</td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+    </Panel>
+  );
+}
+
+function SpendingDetailModule({ budget, categoryMap, vendorList }) {
   const monthKeys = useMemo(() => Object.keys(budget.months || {}).sort(), [budget.months]);
   const rowTotal = (catId) => monthKeys.reduce((s, mk) => s + ((budget.months[mk].spend || {})[catId] || 0), 0);
   const colTotal = (mk) => CATEGORY_DEFS.reduce((s, c) => s + ((budget.months[mk].spend || {})[c.id] || 0), 0);
@@ -665,6 +799,8 @@ function SpendingDetailModule({ budget }) {
           </div>
         )}
       </Panel>
+
+      <TransactionExplorer categoryMap={categoryMap} vendorList={vendorList} />
     </div>
   );
 }
@@ -1223,7 +1359,7 @@ function AppShell({ session }) {
     return <div style={{ background: COLORS.bg, minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', color: COLORS.textDim, fontFamily: 'ui-sans-serif, system-ui' }}>Loading…</div>;
   }
 
-  const { budget, scenarioList, portfolio, vendorList } = data;
+  const { budget, scenarioList, portfolio, vendorList, categoryMap } = data;
 
   // ---- vendor handlers ----
   const onSaveVendor = async (pattern, categoryId, notes) => {
@@ -1334,7 +1470,7 @@ function AppShell({ session }) {
         {tab === 'scenarios' && <ScenariosModule scenarios={scenarioList} onAddScenario={onAddScenario} onUpdateScenario={onUpdateScenario} onRemoveScenario={onRemoveScenario} onAddEvent={onAddEvent} onUpdateEvent={onUpdateEvent} onRemoveEvent={onRemoveEvent} onSetHorizon={onSetHorizon} />}
         {tab === 'investments' && <InvestmentModule portfolio={portfolio} onUpdateSettings={onUpdateSettings} onUpdateAllocation={onUpdateAllocation} />}
         {tab === 'assistant' && <AssistantModule budget={budget} scenarioList={scenarioList} portfolio={portfolio} onUpdateMonth={onUpdateMonth} onAddIncomeSource={onAddIncomeSource} onRenameIncomeSource={onRenameIncomeSource} onRemoveIncomeSource={onRemoveIncomeSource} onAddScenario={onAddScenario} onUpdateScenario={onUpdateScenario} onRemoveScenario={onRemoveScenario} onAddEvent={onAddEvent} onRemoveEvent={onRemoveEvent} onUpdateSettings={onUpdateSettings} onUpdateAllocation={onUpdateAllocation} />}
-        {tab === 'detail' && <SpendingDetailModule budget={budget} />}
+        {tab === 'detail' && <SpendingDetailModule budget={budget} categoryMap={categoryMap} vendorList={vendorList} />}
       </div>
     </div>
   );
